@@ -5777,9 +5777,19 @@ impl QuicConnection {
         // packets need (Initial AEAD alone is forgeable, RFC 9001 §5.2). The
         // switch keys are derived here and installed after the tag verifies,
         // mirroring the server's first-Initial handling.
+        //
+        // The switch rides on an Initial packet, so it is only on offer
+        // while the Initial level is alive. The client discards that level
+        // when it first sends a Handshake packet (RFC 9001 §4.9.1), which
+        // can be well before the server's EncryptedExtensions settles
+        // `negotiated_version`; in between, an other-version Initial — whose
+        // keys anyone can derive from the public keying DCID — must not
+        // re-key the discarded level, flip `self.version` (dropping the
+        // genuine server's Handshake packets) or get its frames dispatched.
         let client_switch = self.role == Role::Client
             && pkt_version != self.version
             && self.negotiated_version.is_none()
+            && self.endpoint.crypto.at(Level::Initial).rx.is_some()
             && self.original_version.is_compatible_with(pkt_version)
             && level == Level::Initial;
         let client_switch_rx = if client_switch {
@@ -16448,6 +16458,18 @@ mod tests {
         pn: u64,
         plaintext: &mut [u8],
     ) -> Vec<u8> {
+        seal_initial_under_version(QuicVersion::V1, keys, dcid, scid, pn, plaintext)
+    }
+
+    /// [`seal_initial_under`] for an Initial of any `version`.
+    fn seal_initial_under_version(
+        version: QuicVersion,
+        keys: &crate::quic::crypto::DirKeys,
+        dcid: &[u8],
+        scid: &[u8],
+        pn: u64,
+        plaintext: &mut [u8],
+    ) -> Vec<u8> {
         use crate::quic::crypto::aead_seal;
         use crate::quic::pkt::{apply_header_protection, build_long_header};
         assert!(pn < 256, "one-byte packet number");
@@ -16455,7 +16477,7 @@ mod tests {
         let length_field = pn_len as u64 + plaintext.len() as u64 + 16;
         let (mut pkt, pn_offset) = build_long_header(
             LongType::Initial,
-            QuicVersion::V1,
+            version,
             dcid,
             scid,
             &[],
@@ -17430,6 +17452,103 @@ mod tests {
         assert_eq!(c.original_version(), QuicVersion::V1);
         assert_eq!(c.version(), QuicVersion::V2, "client upgraded to v2");
         assert_eq!(s.version(), QuicVersion::V2, "server chose v2");
+    }
+
+    /// RFC 9001 §4.9.1 — the client discards its Initial keys when it first
+    /// sends a Handshake packet, and from then on an Initial is dropped. A
+    /// compatible version switch (RFC 9369 §4.1) is learned from a server
+    /// *Initial*, so it cannot be offered any more either. The switch used
+    /// to be gated only on "no Negotiated Version yet", which stays true
+    /// until the server's EncryptedExtensions is processed: in between, an
+    /// Initial in the other version, sealed under keys anyone can derive
+    /// from the public keying DCID, authenticated — reinstalling the Initial
+    /// level, flipping the connection to that version (so the genuine
+    /// server's Handshake packets no longer parsed) and dispatching its
+    /// frames, CONNECTION_CLOSE included.
+    #[test]
+    fn client_ignores_other_version_initial_once_initial_keys_are_gone() {
+        use crate::quic::crypto::{derive_dir_keys, derive_initial_secrets};
+        use crate::quic::pkt::LongHeader;
+        // The client offers v2 but the server stays on v1.
+        let (mut c, mut s) = loopback_pair_versions(
+            alloc::vec![QuicVersion::V1, QuicVersion::V2],
+            Some(QuicVersion::V1),
+            alloc::vec![QuicVersion::V1],
+        );
+        let odcid = c.original_dcid().expect("ODCID").to_vec();
+        feed_flight(&mut c, &mut s);
+        // Deliver only the server's Initial packets (the ServerHello); hold
+        // back the Handshake packets carrying EncryptedExtensions.
+        let mut held_back: Vec<Vec<u8>> = Vec::new();
+        for dg in drain_datagrams(&mut s) {
+            let mut rest: &[u8] = &dg;
+            let mut initial_part = Vec::new();
+            while !rest.is_empty() {
+                let hdr = LongHeader::parse(rest).expect("long header");
+                let len = hdr.payload_off + usize::try_from(hdr.length).expect("len");
+                if hdr.typ != LongType::Initial {
+                    held_back.push(rest.to_vec());
+                    break;
+                }
+                initial_part.extend_from_slice(&rest[..len]);
+                rest = &rest[len..];
+            }
+            c.feed_datagram(&initial_part)
+                .expect("client feeds Initial");
+        }
+        assert!(!held_back.is_empty(), "a Handshake packet was held back");
+        assert!(c.endpoint.crypto.at(Level::Handshake).tx.is_some());
+        let _ = drain_datagrams(&mut c);
+        // The client sends a Handshake packet before EncryptedExtensions
+        // arrives (as it would to acknowledge the first Handshake packet of
+        // a long server flight, or on a PTO probe).
+        c.endpoint.pn.handshake.pending_ack.insert(0);
+        c.endpoint.pn.handshake.ack_eliciting_pending = true;
+        c.endpoint.pn.handshake.ack_due = true;
+        assert!(!drain_datagrams(&mut c).is_empty());
+        assert!(
+            c.endpoint.crypto.at(Level::Initial).rx.is_none(),
+            "precondition: Initial keys discarded"
+        );
+        assert!(
+            c.negotiated_version.is_none() && !c.is_handshake_complete(),
+            "precondition: EncryptedExtensions not processed yet"
+        );
+
+        // A v2 Initial from "the server" — its SCID is on the wire, and the
+        // v2 Initial keys derive from the client's own first DCID.
+        let (_, server_secret) = derive_initial_secrets(QuicVersion::V2, &odcid);
+        let keys = derive_dir_keys(QuicVersion::V2, AeadAlg::Aes128Gcm, &server_secret);
+        let mut plain = Vec::new();
+        Frame::ConnectionClose {
+            error: ERROR_PROTOCOL_VIOLATION,
+            frame_type: Some(0),
+            reason: b"forged",
+        }
+        .encode(&mut plain);
+        plain.resize(64, 0x00);
+        let dcid = c.endpoint.cids.local.as_slice().to_vec();
+        let scid = c.endpoint.cids.peer.as_slice().to_vec();
+        let forged =
+            seal_initial_under_version(QuicVersion::V2, &keys, &dcid, &scid, 9, &mut plain);
+        assert_eq!(&forged[1..5], &QuicVersion::V2.wire().to_be_bytes());
+        c.feed_datagram(&forged).expect("dropped silently");
+        assert_eq!(c.version(), QuicVersion::V1, "version must not move");
+        assert!(c.negotiated_version.is_none());
+        assert!(
+            c.endpoint.crypto.at(Level::Initial).rx.is_none()
+                && c.endpoint.crypto.at(Level::Initial).tx.is_none(),
+            "the Initial level stays discarded"
+        );
+        assert!(!c.is_closing() && !c.is_draining() && !c.is_closed());
+
+        // The genuine v1 handshake is unaffected.
+        for dg in &held_back {
+            c.feed_datagram(dg).expect("client feeds Handshake");
+        }
+        drive_until_complete(&mut c, &mut s, 8);
+        assert_eq!(c.version(), QuicVersion::V1);
+        assert_eq!(s.version(), QuicVersion::V1);
     }
 
     /// A client offering only v1 and a server offering only v1 stay on v1
