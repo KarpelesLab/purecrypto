@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 
 use crate::quic::connection::Role;
 use crate::quic::frame::{Frame, StreamDir};
+use crate::quic::loss::SentPacket;
 use crate::quic::stream::{RecvState, SendState, Stream, StreamError, StreamId};
 use crate::quic::transport_params::TransportParameters;
 use crate::quic::varint;
@@ -1548,6 +1549,87 @@ impl Streams {
         }
     }
 
+    /// A batch of packets was declared lost (RFC 9002 §6.1): everything
+    /// [`Self::on_chunk_lost`] and [`Self::on_control_lost`] would do for
+    /// each packet's hints in turn, with the same result — the same chunks
+    /// queued for retransmission in the same order, the same control frames
+    /// re-armed, streams marked ready in the same order.
+    ///
+    /// What differs is the cost. The peer decides how many packets are in
+    /// flight and how many of them one acknowledgement declares lost, and
+    /// handling the lost chunks of a stream one call at a time can cost a
+    /// pass over all its in-flight chunks per call. Here each stream gets
+    /// its lost ranges in one [`SendStream::on_ranges_lost`] batch.
+    ///
+    /// The regrouping is sound because the two kinds of hint do not read
+    /// each other's state: a lost chunk only moves data between a send
+    /// half's in-flight set and its retransmit queue, which no control hint
+    /// consults. The only thing they share is the ready queue, and that is
+    /// replayed in the original hint order below.
+    ///
+    /// [`SendStream::on_ranges_lost`]: crate::quic::stream::SendStream::on_ranges_lost
+    pub(crate) fn on_packets_lost(&mut self, lost: &[SentPacket]) {
+        let total: usize = lost
+            .iter()
+            .map(|p| (&p.stream_hints).into_iter().count())
+            .sum();
+        if total <= 1 {
+            for pkt in lost {
+                for h in &pkt.stream_hints {
+                    self.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                }
+                for &h in &pkt.control_hints {
+                    self.on_control_lost(h);
+                }
+            }
+            return;
+        }
+        // Every stream hint, tagged with its position in the batch and
+        // grouped by stream (the sort is stable, so each stream keeps its
+        // hints in batch order).
+        let mut by_stream: Vec<(u64, usize, (u64, u64, bool))> = Vec::with_capacity(total);
+        for h in lost.iter().flat_map(|p| &p.stream_hints) {
+            by_stream.push((h.id, by_stream.len(), (h.offset, h.length, h.fin)));
+        }
+        by_stream.sort_by_key(|&(id, _, _)| id);
+        // `readies[seq]`: hint `seq` is the first of its stream to queue a
+        // retransmission, i.e. the one whose `on_chunk_lost` would have
+        // marked the stream ready.
+        let mut readies = alloc::vec![false; total];
+        let mut ranges: Vec<(u64, u64, bool)> = Vec::new();
+        let mut start = 0usize;
+        while start < by_stream.len() {
+            let id = by_stream[start].0;
+            let len = by_stream[start..]
+                .iter()
+                .take_while(|&&(i, _, _)| i == id)
+                .count();
+            let group = &by_stream[start..start + len];
+            if let Some(stream) = self.map.get_mut(&id)
+                && let Some(send) = stream.send.as_mut()
+            {
+                ranges.clear();
+                ranges.extend(group.iter().map(|&(_, _, r)| r));
+                if let Some(first) = send.on_ranges_lost(&ranges) {
+                    readies[group[first].1] = true;
+                }
+            }
+            start += len;
+        }
+        let mut seq = 0usize;
+        for pkt in lost {
+            for h in &pkt.stream_hints {
+                if readies[seq] {
+                    self.enqueue_ready(h.id);
+                }
+                seq += 1;
+            }
+            for &h in &pkt.control_hints {
+                self.on_control_lost(h);
+            }
+        }
+    }
+
     /// RFC 9000 §13.3 — a packet carrying the control frame `hint` was
     /// declared lost: queue the frame again if it is still needed, with
     /// its current value.
@@ -2902,6 +2984,151 @@ mod tests {
         s.on_max_data(1000);
         s.on_control_lost(db);
         assert!(pop_all(&mut s).is_empty(), "not blocked any more");
+    }
+
+    /// `on_packets_lost` hands each stream its lost ranges as one batch.
+    /// The outcome must be what handling every hint of every lost packet in
+    /// turn produces: the same retransmit queues, the same in-flight sets,
+    /// the same order of streams in the ready queue (control hints
+    /// included), and so the same frames on the wire afterwards.
+    #[test]
+    fn batched_loss_matches_per_hint_handling() {
+        use crate::quic::loss::{StreamHint, StreamHints};
+        use core::time::Duration;
+
+        // Three streams with data in flight in small interleaved frames,
+        // one of them blocked on stream credit; every frame popped is
+        // recorded into "packets" of up to three frames.
+        fn scenario() -> (Streams, Vec<SentPacket>) {
+            let our = params_with(1 << 16, 1 << 20, 8);
+            let peer = params_with(4000, 1 << 20, 8);
+            let mut s = Streams::new(Role::Server, &our, &peer);
+            let ids: Vec<StreamId> = (0..3).map(|_| s.open_bidi().expect("open")).collect();
+            let data = [0x5au8; 6000];
+            for (i, id) in ids.iter().enumerate() {
+                // The first stream wants more than its 4000-byte window.
+                let want = if i == 0 { 6000 } else { 2500 + i * 300 };
+                let _ = s.write(*id, &data[..want]).expect("write");
+            }
+            s.finish(ids[2]).expect("finish");
+            let mut packets: Vec<SentPacket> = Vec::new();
+            let mut frames_in_packet = 0;
+            while let Some(f) = s.pop_frame(48) {
+                if frames_in_packet == 0 {
+                    packets.push(SentPacket {
+                        pn: packets.len() as u64,
+                        sent_bytes: 100,
+                        ack_eliciting: true,
+                        in_flight: true,
+                        time_sent: Duration::ZERO,
+                        retransmit_hint: Vec::new(),
+                        stream_hints: StreamHints::new(),
+                        control_hints: Vec::new(),
+                        handshake_done: false,
+                    });
+                }
+                let pkt = packets.last_mut().unwrap();
+                match f {
+                    PoppedFrame::Stream {
+                        id,
+                        offset,
+                        len,
+                        fin,
+                    } => pkt.stream_hints.push(StreamHint {
+                        id,
+                        offset,
+                        length: len,
+                        fin,
+                    }),
+                    other => pkt
+                        .control_hints
+                        .push(other.control_hint().expect("a control frame")),
+                }
+                frames_in_packet = (frames_in_packet + 1) % 3;
+            }
+            assert!(packets.len() > 60, "{} packets", packets.len());
+            assert!(
+                packets.iter().any(|p| !p.control_hints.is_empty()),
+                "a STREAM_DATA_BLOCKED went out"
+            );
+            (s, packets)
+        }
+
+        fn state(s: &mut Streams) -> alloc::string::String {
+            let mut out = alloc::format!("{:?}", s.ready_to_send);
+            for (id, st) in s.map.iter() {
+                let send = st.send.as_ref().expect("bidi");
+                out += &alloc::format!(
+                    "\n{id}: rtx {:?} sent {:?} blocked {:?}",
+                    send.rtx_queue
+                        .iter()
+                        .map(|c| (c.0, c.1.len(), c.2))
+                        .collect::<Vec<_>>(),
+                    send.sent_chunks
+                        .iter()
+                        .map(|c| (c.0, c.1.len(), c.2))
+                        .collect::<Vec<_>>(),
+                    send.blocked_at,
+                );
+            }
+            // And what goes on the wire next.
+            while let Some(f) = s.pop_frame(200) {
+                out += &alloc::format!("\n{f:?}");
+            }
+            out
+        }
+
+        // Several loss patterns: everything, in send order and reversed
+        // (which also leaves the in-flight sets unsorted for the next
+        // round); a first small loss that is retransmitted, then the rest.
+        for pattern in 0..4 {
+            let (mut batched, packets) = scenario();
+            let (mut one_by_one, _) = scenario();
+            let mut rounds: Vec<Vec<SentPacket>> = Vec::new();
+            match pattern {
+                0 => rounds.push(packets.clone()),
+                1 => rounds.push(packets.iter().rev().cloned().collect()),
+                2 => {
+                    rounds.push(packets[3..6].to_vec());
+                    let mut rest: Vec<SentPacket> = packets[..3].to_vec();
+                    rest.extend_from_slice(&packets[6..]);
+                    // The first three packets' hints again: stale by now.
+                    rest.extend_from_slice(&packets[3..6]);
+                    rounds.push(rest);
+                }
+                _ => {
+                    rounds.push(packets.iter().step_by(2).cloned().collect());
+                    rounds.push(packets.iter().skip(1).step_by(2).rev().cloned().collect());
+                }
+            }
+            let last = rounds.len() - 1;
+            for (i, lost) in rounds.iter().enumerate() {
+                batched.on_packets_lost(lost);
+                for pkt in lost {
+                    for h in &pkt.stream_hints {
+                        one_by_one.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                    }
+                    for &h in &pkt.control_hints {
+                        one_by_one.on_control_lost(h);
+                    }
+                }
+                if i != last {
+                    // Send a little of what was queued again, so the next
+                    // round meets in-flight sets that are out of order.
+                    for s in [&mut batched, &mut one_by_one] {
+                        for _ in 0..4 {
+                            let _ = s.pop_frame(48);
+                        }
+                    }
+                }
+            }
+            let (a, b) = (state(&mut batched), state(&mut one_by_one));
+            assert!(
+                a.contains("rtx [("),
+                "pattern {pattern}: something was lost"
+            );
+            assert_eq!(a, b, "pattern {pattern}");
+        }
     }
 
     /// RFC 9000 §3.1 / §13.3 — a RESET_STREAM is retransmitted until it is

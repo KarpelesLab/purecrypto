@@ -2922,14 +2922,7 @@ impl QuicConnection {
         }
         self.note_handshake_done_fate(&[], lost);
         if let Some(streams) = self.streams.as_mut() {
-            for pkt in lost {
-                for h in &pkt.stream_hints {
-                    streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
-                }
-                for &h in &pkt.control_hints {
-                    streams.on_control_lost(h);
-                }
-            }
+            streams.on_packets_lost(lost);
         }
     }
 
@@ -6597,17 +6590,12 @@ impl QuicConnection {
                                 streams.on_control_acked(h);
                             }
                         }
-                        for pkt in &lost {
-                            for h in &pkt.stream_hints {
-                                streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
-                            }
-                            // 6c. Control frames the lost packets carried
-                            //     (MAX_DATA, MAX_STREAM_DATA, ...) are sent
-                            //     again if still needed (RFC 9000 §13.3).
-                            for &h in &pkt.control_hints {
-                                streams.on_control_lost(h);
-                            }
-                        }
+                        // 6c. ... along with the control frames the lost
+                        //     packets carried (MAX_DATA, MAX_STREAM_DATA,
+                        //     ...), sent again if still needed (RFC 9000
+                        //     §13.3). One batch: the peer picks how many
+                        //     packets a single ACK declares lost.
+                        streams.on_packets_lost(&lost);
                     }
                     // Keep the per-space `largest_acked_tx` up to date for the
                     // sender-side bookkeeping that reads it.

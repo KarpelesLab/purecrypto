@@ -199,6 +199,14 @@ pub(crate) struct SendStream {
     /// ([`Self::on_range_acked`]) and moved to [`Self::rtx_queue`] when
     /// it is declared lost ([`Self::on_range_lost`]) or a PTO fires
     /// ([`Self::requeue_all_sent`]).
+    ///
+    /// The chunks are pairwise disjoint: every stream byte is carved from
+    /// `write_buf` exactly once and its chunk is thereafter only moved
+    /// between this deque and `rtx_queue`, or split on retransmission. The
+    /// only zero-length chunk ever stored is a FIN-only frame, at the
+    /// stream's final size ([`Self::push_sent`] drops the rest as vacuously
+    /// acknowledged). So while the deque is sorted by offset
+    /// (`sent_sorted`), chunk *ends* are non-decreasing too.
     pub(crate) sent_chunks: VecDeque<(u64, Vec<u8>, bool)>,
     /// True while `sent_chunks` is in non-decreasing offset order — the
     /// usual case, as fresh data is carved in order; a retransmission
@@ -218,6 +226,11 @@ pub(crate) struct SendStream {
     pub(crate) acked_ranges: BTreeMap<u64, u64>,
     /// True once a FIN-bearing STREAM frame has been acknowledged.
     pub(crate) fin_acked: bool,
+    /// Test instrumentation: how many in-flight chunks loss handling has
+    /// examined (plus the size of every index it built), so a test can
+    /// bound the work a batch of losses costs.
+    #[cfg(test)]
+    pub(crate) loss_work: u64,
 }
 
 /// Appends `data` to `dst` with two slice copies (the deque's tail may
@@ -324,6 +337,8 @@ impl SendStream {
             rtx_queue: VecDeque::new(),
             acked_ranges: BTreeMap::new(),
             fin_acked: false,
+            #[cfg(test)]
+            loss_work: 0,
         }
     }
 
@@ -483,31 +498,242 @@ impl SendStream {
 
     /// The carrying packet of `[offset, offset + len)` was declared
     /// lost (RFC 9002 §6.1). Moves every overlapping, not-yet-acked
-    /// in-flight chunk into the retransmit queue. Returns `true` if
-    /// anything was queued (the caller should mark the stream ready).
+    /// in-flight chunk into the retransmit queue, in the order the chunks
+    /// were sent. Returns `true` if anything was queued (the caller should
+    /// mark the stream ready).
+    ///
+    /// The peer decides how many packets are in flight and how many of
+    /// them one acknowledgement declares lost, so this must not cost a
+    /// pass over (let alone a rebuild of) every in-flight chunk per lost
+    /// packet. With `sent_chunks` sorted the affected chunks are a run
+    /// found by binary search; otherwise one in-place pass moves them —
+    /// and a whole batch of losses goes through [`Self::on_ranges_lost`],
+    /// which makes that a single pass for the batch.
     pub(crate) fn on_range_lost(&mut self, offset: u64, len: u64, fin: bool) -> bool {
-        let end = offset.saturating_add(len);
-        let mut keep: VecDeque<(u64, Vec<u8>, bool)> = VecDeque::new();
-        let mut moved = false;
-        while let Some((c_off, c_bytes, c_fin)) = self.sent_chunks.pop_front() {
-            let c_end = c_off + c_bytes.len() as u64;
-            let overlaps_data = c_off < end && offset < c_end;
-            // A FIN-only frame has a zero-length range; match it by
-            // offset + FIN bit.
-            let fin_only_match = c_bytes.is_empty() && c_fin && fin && c_off == offset;
-            let acked = self.chunk_acked(c_off, c_bytes.len(), c_fin);
-            if (overlaps_data || fin_only_match) && !acked {
-                self.rtx_queue.push_back((c_off, c_bytes, c_fin));
-                moved = true;
-            } else {
-                keep.push_back((c_off, c_bytes, c_fin));
-            }
-        }
-        self.sent_chunks = keep;
+        let moved = if self.sent_sorted {
+            self.lose_range_sorted(offset, len, fin)
+        } else {
+            self.lose_range_scan(offset, len, fin)
+        };
         if self.sent_chunks.is_empty() {
             self.sent_sorted = true;
         }
         moved
+    }
+
+    /// A batch of [`Self::on_range_lost`] calls — one per `(offset, len,
+    /// fin)` in `hints`, in order — with exactly the same outcome: the same
+    /// chunks end up in the retransmit queue, in the same order. Returns the
+    /// index of the first hint that queued anything, if one did.
+    ///
+    /// Unlike the calls it replaces, the cost does not multiply the number
+    /// of hints by the number of chunks in flight when `sent_chunks` is not
+    /// sorted: the chunks are indexed by offset once, and every hint then
+    /// finds its own.
+    pub(crate) fn on_ranges_lost(&mut self, hints: &[(u64, u64, bool)]) -> Option<usize> {
+        // Below this many hints, a pass per hint is cheaper than an index.
+        const INDEX_THRESHOLD: usize = 16;
+        let mut first = None;
+        let mut rest = hints;
+        let mut done = 0usize;
+        while let Some((&(offset, len, fin), tail)) = rest.split_first() {
+            if !self.sent_sorted && rest.len() >= INDEX_THRESHOLD {
+                // (Moving chunks out never un-sorts the deque, so once on
+                // the indexed path the remainder of the batch stays on it.)
+                if let Some(i) = self.lose_ranges_indexed(rest) {
+                    first.get_or_insert(done + i);
+                }
+                break;
+            }
+            if self.on_range_lost(offset, len, fin) {
+                first.get_or_insert(done);
+            }
+            done += 1;
+            rest = tail;
+        }
+        if self.sent_chunks.is_empty() {
+            self.sent_sorted = true;
+        }
+        first
+    }
+
+    /// The loss predicate of [`Self::on_range_lost`]: does the lost range
+    /// `[offset, end)` (with `fin` per the lost frame's FIN bit) call for
+    /// chunk `c` to be sent again?
+    fn chunk_lost_by(&self, c: &(u64, Vec<u8>, bool), offset: u64, end: u64, fin: bool) -> bool {
+        let (c_off, c_bytes, c_fin) = (c.0, &c.1, c.2);
+        let c_end = c_off + c_bytes.len() as u64;
+        let overlaps_data = c_off < end && offset < c_end;
+        // A FIN-only frame has a zero-length range; match it by
+        // offset + FIN bit.
+        let fin_only_match = c_bytes.is_empty() && c_fin && fin && c_off == offset;
+        (overlaps_data || fin_only_match) && !self.chunk_acked(c_off, c_bytes.len(), c_fin)
+    }
+
+    /// [`Self::on_range_lost`] with `sent_chunks` sorted by offset: every
+    /// chunk the lost range can touch lies in one run, bounded on the left
+    /// by chunk end (non-decreasing, see `sent_chunks`) and on the right by
+    /// chunk offset. Falls back to [`Self::lose_range_scan`] should the run
+    /// not have the expected shape.
+    fn lose_range_sorted(&mut self, offset: u64, len: u64, fin: bool) -> bool {
+        let end = offset.saturating_add(len);
+        let n = self.sent_chunks.len();
+        // A chunk ending before `offset` neither overlaps the range nor
+        // starts at `offset`; one starting at or past `end` does not
+        // overlap, and can only be the FIN-only match when it starts at
+        // `offset == end`.
+        let mut lo = self
+            .sent_chunks
+            .partition_point(|c| c.0 + (c.1.len() as u64) < offset);
+        let mut hi = self
+            .sent_chunks
+            .partition_point(|c| c.0 < end || (offset == end && c.0 == end));
+        if lo >= hi {
+            return false;
+        }
+        // Cheap guard on the run's shape: its outer neighbours must not be
+        // affected. (They cannot be while the ordering invariant holds.)
+        let outside = (lo > 0 && self.chunk_lost_by(&self.sent_chunks[lo - 1], offset, end, fin))
+            || (hi < n && self.chunk_lost_by(&self.sent_chunks[hi], offset, end, fin));
+        // Only the ends of the run can be unaffected: a chunk that merely
+        // abuts the range, or one already acknowledged.
+        while lo < hi && !self.chunk_lost_by(&self.sent_chunks[lo], offset, end, fin) {
+            lo += 1;
+            self.note_loss_work(1);
+        }
+        while hi > lo && !self.chunk_lost_by(&self.sent_chunks[hi - 1], offset, end, fin) {
+            hi -= 1;
+            self.note_loss_work(1);
+        }
+        self.note_loss_work((hi - lo) as u64 + 2);
+        let solid = self
+            .sent_chunks
+            .range(lo..hi)
+            .all(|c| self.chunk_lost_by(c, offset, end, fin));
+        if outside || !solid {
+            return self.lose_range_scan(offset, len, fin);
+        }
+        if lo == hi {
+            return false;
+        }
+        self.rtx_queue.extend(self.sent_chunks.drain(lo..hi));
+        true
+    }
+
+    /// [`Self::on_range_lost`] for any `sent_chunks` order: one pass over
+    /// the deque, moving the affected chunks out in place.
+    fn lose_range_scan(&mut self, offset: u64, len: u64, fin: bool) -> bool {
+        let end = offset.saturating_add(len);
+        let n = self.sent_chunks.len();
+        self.note_loss_work(n as u64);
+        let mut kept = 0usize;
+        for i in 0..n {
+            if self.chunk_lost_by(&self.sent_chunks[i], offset, end, fin) {
+                let chunk = core::mem::take(&mut self.sent_chunks[i]);
+                self.rtx_queue.push_back(chunk);
+            } else {
+                // Slot `kept` holds a chunk already moved out (or is `i`).
+                if kept != i {
+                    self.sent_chunks.swap(kept, i);
+                }
+                kept += 1;
+            }
+        }
+        self.sent_chunks.truncate(kept);
+        kept != n
+    }
+
+    /// [`Self::on_ranges_lost`] for a large batch against an unsorted
+    /// `sent_chunks`. Indexes the chunks by offset once; each hint then
+    /// binary-searches the run of chunks it can touch and claims the ones
+    /// no earlier hint took — which is what applying the hints one after
+    /// the other does, since a chunk leaves `sent_chunks` with the first
+    /// hint that affects it. Chunks are appended to the retransmit queue
+    /// hint by hint, in deque order within a hint, exactly as before.
+    fn lose_ranges_indexed(&mut self, hints: &[(u64, u64, bool)]) -> Option<usize> {
+        let n = self.sent_chunks.len();
+        if n == 0 {
+            return None;
+        }
+        self.note_loss_work(n as u64);
+        // Deque positions in (offset, length) order ...
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&p| {
+            let c = &self.sent_chunks[p];
+            (c.0, c.1.len())
+        });
+        // ... with the running maximum of the chunk ends. Disjoint chunks
+        // make this simply each chunk's own end; taking the maximum keeps
+        // the search below correct whatever the chunks look like.
+        let mut max_end: Vec<u64> = Vec::with_capacity(n);
+        let mut running = 0u64;
+        for &p in &order {
+            let c = &self.sent_chunks[p];
+            running = running.max(c.0 + c.1.len() as u64);
+            max_end.push(running);
+        }
+        // `next[k]`: the first index >= k (in `order`) not yet claimed.
+        // Path-halved, so skipping claimed runs is amortised O(1).
+        let mut next: Vec<usize> = (0..=n).collect();
+        fn find(next: &mut [usize], mut k: usize) -> usize {
+            while next[k] != k {
+                next[k] = next[next[k]];
+                k = next[k];
+            }
+            k
+        }
+        // Claimed deque positions, grouped by hint in hint order.
+        let mut claimed: Vec<usize> = Vec::new();
+        let mut first = None;
+        for (i, &(offset, len, fin)) in hints.iter().enumerate() {
+            let end = offset.saturating_add(len);
+            let lo = max_end.partition_point(|&e| e < offset);
+            let hi = order.partition_point(|&p| {
+                let c_off = self.sent_chunks[p].0;
+                c_off < end || (offset == end && c_off == end)
+            });
+            let group = claimed.len();
+            let mut k = find(&mut next, lo);
+            while k < hi {
+                let p = order[k];
+                self.note_loss_work(1);
+                if self.chunk_lost_by(&self.sent_chunks[p], offset, end, fin) {
+                    claimed.push(p);
+                    next[k] = k + 1;
+                }
+                k = find(&mut next, k + 1);
+            }
+            if claimed.len() > group {
+                claimed[group..].sort_unstable();
+                first.get_or_insert(i);
+            }
+        }
+        if claimed.is_empty() {
+            return None;
+        }
+        let mut gone = alloc::vec![false; n];
+        self.rtx_queue.reserve(claimed.len());
+        for &p in &claimed {
+            gone[p] = true;
+            let chunk = core::mem::take(&mut self.sent_chunks[p]);
+            self.rtx_queue.push_back(chunk);
+        }
+        let mut pos = 0usize;
+        self.sent_chunks.retain(|_| {
+            let keep = !gone[pos];
+            pos += 1;
+            keep
+        });
+        first
+    }
+
+    /// Test instrumentation, see `loss_work`.
+    #[inline]
+    fn note_loss_work(&mut self, _n: u64) {
+        #[cfg(test)]
+        {
+            self.loss_work += _n;
+        }
     }
 
     /// True if any chunk awaits retransmission.
@@ -1285,6 +1511,194 @@ mod tests {
             }
             assert!(s.fin_acked && !s.has_unacked());
             assert_eq!(s.acked_offset, total as u64);
+        }
+    }
+
+    /// The loss handling this module used before it stopped rebuilding the
+    /// in-flight deque per lost packet, kept as the reference the faster
+    /// paths are checked against: pop every chunk, send the affected ones to
+    /// the retransmit queue, keep the rest.
+    fn reference_on_range_lost(s: &mut SendStream, offset: u64, len: u64, fin: bool) -> bool {
+        let end = offset.saturating_add(len);
+        let mut keep: VecDeque<(u64, Vec<u8>, bool)> = VecDeque::new();
+        let mut moved = false;
+        while let Some((c_off, c_bytes, c_fin)) = s.sent_chunks.pop_front() {
+            let c_end = c_off + c_bytes.len() as u64;
+            let overlaps_data = c_off < end && offset < c_end;
+            let fin_only_match = c_bytes.is_empty() && c_fin && fin && c_off == offset;
+            let acked = s.chunk_acked(c_off, c_bytes.len(), c_fin);
+            if (overlaps_data || fin_only_match) && !acked {
+                s.rtx_queue.push_back((c_off, c_bytes, c_fin));
+                moved = true;
+            } else {
+                keep.push_back((c_off, c_bytes, c_fin));
+            }
+        }
+        s.sent_chunks = keep;
+        if s.sent_chunks.is_empty() {
+            s.sent_sorted = true;
+        }
+        moved
+    }
+
+    /// A copy of the loss-relevant state of `s`.
+    fn clone_send_state(s: &SendStream) -> SendStream {
+        let mut c = SendStream::new(s.peer_max_data);
+        c.sent_chunks = s.sent_chunks.clone();
+        c.sent_sorted = s.sent_sorted;
+        c.rtx_queue = s.rtx_queue.clone();
+        c.acked_ranges = s.acked_ranges.clone();
+        c.fin_acked = s.fin_acked;
+        c
+    }
+
+    /// Randomised differential test: single losses and whole batches of
+    /// them (sorted and unsorted in-flight sets, acknowledged ranges,
+    /// FIN-only frames, stale and partially overlapping hints) leave the
+    /// in-flight set and the retransmit queue exactly as the reference
+    /// leaves them — same chunks, same order — and report the same thing.
+    #[test]
+    fn loss_handling_matches_the_reference() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut indexed_batches = 0;
+        for round in 0..300 {
+            let total = 1 + rnd(6000) as usize;
+            let mut s = SendStream::new(u64::MAX);
+            let data: Vec<u8> = (0..total).map(|i| (i * 13 + round) as u8).collect();
+            assert_eq!(s.enqueue(&data), total);
+            s.finish();
+            // Every chunk ever put on the wire, as a loss/ack hint.
+            let mut wire: Vec<(u64, u64, bool)> = Vec::new();
+            for _ in 0..400 {
+                match rnd(12) {
+                    0..=5 => {
+                        let cap = 1 + rnd(120) as usize;
+                        // Fresh data is sometimes carved ahead of queued
+                        // retransmissions, to vary the in-flight order.
+                        let c = if s.has_rtx() && rnd(4) != 0 {
+                            s.pop_rtx(cap)
+                        } else if s.has_outbound() && (!s.write_buf.is_empty() || !s.has_rtx()) {
+                            s.carve(if s.write_buf.is_empty() { 0 } else { cap })
+                        } else {
+                            None
+                        };
+                        if let Some((off, bytes, fin)) = c {
+                            wire.push((off, bytes.len() as u64, fin));
+                        }
+                    }
+                    6 if !wire.is_empty() => {
+                        let (off, len, fin) = wire[rnd(wire.len() as u64) as usize];
+                        s.on_range_acked(off, len, fin);
+                    }
+                    7 | 8 if !wire.is_empty() => {
+                        // One loss: a real hint, or a made-up range.
+                        let (off, len, fin) = if rnd(4) == 0 {
+                            (rnd(total as u64 + 2), rnd(300), rnd(2) == 0)
+                        } else {
+                            wire[rnd(wire.len() as u64) as usize]
+                        };
+                        let mut r = clone_send_state(&s);
+                        let want = reference_on_range_lost(&mut r, off, len, fin);
+                        assert_eq!(s.on_range_lost(off, len, fin), want);
+                        assert_eq!(s.sent_chunks, r.sent_chunks);
+                        assert_eq!(s.rtx_queue, r.rtx_queue);
+                    }
+                    9..=11 if !wire.is_empty() => {
+                        // A batch, in random order, with repeats.
+                        let count = 1 + rnd(60) as usize;
+                        let hints: Vec<(u64, u64, bool)> = (0..count)
+                            .map(|_| {
+                                if rnd(8) == 0 {
+                                    (rnd(total as u64 + 2), rnd(300), rnd(2) == 0)
+                                } else {
+                                    wire[rnd(wire.len() as u64) as usize]
+                                }
+                            })
+                            .collect();
+                        if !s.sent_sorted && count >= 16 && !s.sent_chunks.is_empty() {
+                            indexed_batches += 1;
+                        }
+                        let mut r = clone_send_state(&s);
+                        let mut want = None;
+                        for (i, &(off, len, fin)) in hints.iter().enumerate() {
+                            if reference_on_range_lost(&mut r, off, len, fin) {
+                                want.get_or_insert(i);
+                            }
+                        }
+                        assert_eq!(s.on_ranges_lost(&hints), want);
+                        assert_eq!(s.sent_chunks, r.sent_chunks);
+                        assert_eq!(s.rtx_queue, r.rtx_queue);
+                        assert!(s.sent_sorted || !s.sent_chunks.is_empty());
+                    }
+                    _ => {}
+                }
+                // Whatever is flagged sorted really is.
+                if s.sent_sorted {
+                    assert!(
+                        s.sent_chunks
+                            .iter()
+                            .zip(s.sent_chunks.iter().skip(1))
+                            .all(|(a, b)| a.0 <= b.0)
+                    );
+                }
+            }
+        }
+        assert!(indexed_batches > 50, "the indexed path was exercised");
+    }
+
+    /// The peer chooses how many packets are in flight and can have one
+    /// acknowledgement declare nearly all of them lost. Handling each lost
+    /// packet used to pop and rebuild the stream's whole in-flight deque:
+    /// 20 000 chunks lost in one batch cost 20 000 × 20 000 chunk moves.
+    /// The work is now proportional to the batch, both when the in-flight
+    /// set is still in offset order and when an earlier retransmission has
+    /// left it unsorted — and the retransmit queue comes out the same.
+    #[test]
+    fn losing_every_in_flight_chunk_is_not_quadratic() {
+        const N: usize = 20_000;
+        for unsorted in [false, true] {
+            let mut s = SendStream::new(u64::MAX);
+            let data: Vec<u8> = (0..N * 3).map(|i| i as u8).collect();
+            assert_eq!(s.enqueue(&data), data.len());
+            let mut hints: Vec<(u64, u64, bool)> = Vec::with_capacity(N);
+            for _ in 0..N {
+                let (off, bytes, fin) = s.carve(3).unwrap();
+                hints.push((off, bytes.len() as u64, fin));
+            }
+            if unsorted {
+                // An early chunk is lost and sent again: it re-enters the
+                // in-flight set behind every later offset.
+                assert!(s.on_range_lost(hints[1].0, hints[1].1, false));
+                s.pop_rtx(100).unwrap();
+                assert!(!s.sent_sorted);
+                // Its packet's hint now trails the others, as its packet
+                // number does.
+                let h = hints.remove(1);
+                hints.push(h);
+            }
+            assert_eq!(s.sent_chunks.len(), N);
+
+            let mut r = clone_send_state(&s);
+            for &(off, len, fin) in &hints {
+                reference_on_range_lost(&mut r, off, len, fin);
+            }
+
+            s.loss_work = 0;
+            assert_eq!(s.on_ranges_lost(&hints), Some(0));
+            assert!(
+                s.loss_work <= 8 * N as u64,
+                "unsorted={unsorted}: examined {} chunks for {N} losses",
+                s.loss_work
+            );
+            assert!(s.sent_chunks.is_empty() && s.sent_sorted);
+            assert_eq!(s.rtx_queue.len(), N);
+            assert_eq!(s.rtx_queue, r.rtx_queue, "unsorted={unsorted}");
         }
     }
 
