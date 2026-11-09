@@ -124,7 +124,7 @@ pub(crate) fn random_default_scid() -> ConnectionId {
 }
 
 use core::time::Duration;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -216,6 +216,10 @@ struct Hosted {
     /// first-Initial DCID and, after a Retry, the SCID it was redirected to.
     /// Routed as `(addr, cid)` pairs, never by address alone (M-3).
     initial_routes: Vec<(SocketAddr, ConnectionId)>,
+    /// Whether this connection is counted in `QuicServer::half_open`. Set
+    /// on accept and cleared the first time the router sees the peer's
+    /// address validated (a connection never goes back to half-open).
+    half_open: bool,
 }
 
 /// A sans-I/O QUIC server that demultiplexes inbound UDP datagrams to per-peer
@@ -242,7 +246,25 @@ pub struct QuicServer {
     max_connections: usize,
     /// Cap on connections whose peer address is still unvalidated (M-4).
     max_half_open: usize,
-    conns: HashMap<u64, Hosted>,
+    /// Hosted connections by id. Ids are handed out in accept order, so
+    /// this is also oldest-first; ordered so [`Self::poll_transmit`] can
+    /// resume where it left off.
+    conns: BTreeMap<u64, Hosted>,
+    /// Where [`Self::poll_transmit`] resumes: the id of the connection that
+    /// produced the last datagram.
+    tx_cursor: u64,
+    /// How many hosted connections are flagged `Hosted::half_open` — the
+    /// number the M-4 budget is checked against on every unrecognised
+    /// Initial, kept as a count so that check does not walk the table.
+    half_open: usize,
+    /// Ids of connections accepted while half-open, oldest first, for
+    /// eviction. Entries are not removed when a connection validates or
+    /// goes away; stale ones are skipped (and periodically swept).
+    half_open_order: VecDeque<u64>,
+    /// Test instrumentation: how many times [`Self::poll_transmit`] has
+    /// asked a connection for a datagram.
+    #[cfg(test)]
+    tx_polls: u64,
     /// Our issued local CIDs → connection id (primary routing table).
     by_cid: HashMap<ConnectionId, u64>,
     /// Source address → connection id. Fallback for short-header packets
@@ -332,7 +354,12 @@ impl QuicServer {
             reset_key: reset_key.into(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_half_open: DEFAULT_MAX_HALF_OPEN,
-            conns: HashMap::new(),
+            conns: BTreeMap::new(),
+            tx_cursor: 0,
+            half_open: 0,
+            half_open_order: VecDeque::new(),
+            #[cfg(test)]
+            tx_polls: 0,
             by_cid: HashMap::new(),
             by_addr: HashMap::new(),
             by_initial: HashMap::new(),
@@ -387,6 +414,13 @@ impl QuicServer {
 
     /// Number of hosted connections whose peer address is not yet validated
     /// (RFC 9000 §8.1) — the state a source-address flood can create.
+    ///
+    /// This recounts over every hosted connection. The router itself
+    /// enforces the budget from a running count, which it updates as it
+    /// routes datagrams; a connection the host feeds directly (through
+    /// [`Self::connections_mut`]) until it validates stays counted until
+    /// the next [`Self::on_timeout`], so the budget is then enforced
+    /// slightly early rather than late.
     pub fn half_open_count(&self) -> usize {
         self.conns
             .values()
@@ -537,21 +571,51 @@ impl QuicServer {
         if let Some(p) = self.pending.pop_front() {
             return Some(p);
         }
-        let mut out = None;
-        for (&id, h) in self.conns.iter_mut() {
+        // Resume at the connection that produced the last datagram instead
+        // of starting over: draining k datagrams then costs one lap of the
+        // table (plus the lap that finds nothing left), not k laps. Every
+        // connection is still asked before `None` is returned.
+        fn poll_one(h: &mut Hosted) -> Option<(SocketAddr, EcnCodepoint, Vec<u8>)> {
             // RFC 9000 §8.2.2 — a PATH_RESPONSE for a path the peer is only
             // probing goes to that address, not the connection's current one.
             if let Some((to, dg)) = h.conn.pop_offpath_datagram() {
-                out = Some((id, (to, h.conn.egress_ecn(), dg)));
-                break;
+                return Some((to, h.conn.egress_ecn(), dg));
             }
             let dg = h.conn.pop_datagram();
-            if !dg.is_empty() {
-                out = Some((id, (h.addr, h.conn.egress_ecn(), dg)));
+            (!dg.is_empty()).then(|| (h.addr, h.conn.egress_ecn(), dg))
+        }
+        let cursor = self.tx_cursor;
+        let mut out = None;
+        #[cfg(test)]
+        let mut polls = 0u64;
+        for (&id, h) in self.conns.range_mut(cursor..) {
+            #[cfg(test)]
+            {
+                polls += 1;
+            }
+            if let Some(dg) = poll_one(h) {
+                out = Some((id, dg));
                 break;
             }
         }
+        if out.is_none() {
+            for (&id, h) in self.conns.range_mut(..cursor) {
+                #[cfg(test)]
+                {
+                    polls += 1;
+                }
+                if let Some(dg) = poll_one(h) {
+                    out = Some((id, dg));
+                    break;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.tx_polls += polls;
+        }
         let (id, datagram) = out?;
+        self.tx_cursor = id;
         // Building a datagram may mint fresh local CIDs (NEW_CONNECTION_ID,
         // RFC 9000 §5.1.1). Route them *before* the datagram announcing them
         // leaves: otherwise a peer that switches to a just-issued CID (e.g.
@@ -587,10 +651,19 @@ impl QuicServer {
     /// closed (RFC 9002 PTO, RFC 9000 §10.1 idle timeout, …).
     pub fn on_timeout(&mut self) {
         let now = Instant::now();
+        let mut validated = 0usize;
         for h in self.conns.values_mut() {
             let elapsed = now.saturating_duration_since(h.conn.started_at());
             h.conn.on_timeout(elapsed);
+            // This walk visits every connection anyway, so it also brings
+            // the half-open count back in line with any connection the
+            // host drove itself through `connections_mut`.
+            if h.half_open && !Self::is_half_open(h) {
+                h.half_open = false;
+                validated += 1;
+            }
         }
+        self.half_open -= validated;
         self.reap_closed();
         // M-4: half-open connections get a much shorter deadline than the
         // connection-level idle timeout.
@@ -632,6 +705,10 @@ impl QuicServer {
                 // application observes it through
                 // `connections_mut()` + `close_info()`.
                 let _ = h.conn.feed_datagram_from_with_ecn(from, ecn, datagram);
+                if h.half_open && !Self::is_half_open(h) {
+                    h.half_open = false;
+                    self.half_open -= 1;
+                }
                 // RFC 9000 §9 — the *connection* decides where replies go. It
                 // follows the peer to a new address only after an
                 // authenticated, non-probing, highest-numbered 1-RTT packet
@@ -754,11 +831,12 @@ impl QuicServer {
         // connection table with state no peer will ever claim. Over the
         // budget, the oldest unvalidated connection makes way for the new
         // arrival; a validated or completed connection is never evicted.
-        if self.half_open_count() >= self.max_half_open {
-            self.reap_half_open(Instant::now());
-            if self.half_open_count() >= self.max_half_open && !self.evict_oldest_half_open() {
-                return Ok(());
-            }
+        //
+        // The check runs for every unrecognised Initial, so it reads a
+        // running count and evicts from a queue rather than walking the
+        // connection table.
+        if self.half_open >= self.max_half_open && !self.evict_oldest_half_open() {
+            return Ok(());
         }
         let mut cfg = (self.make_config)()?;
         cfg.reset_key = Some(self.reset_key.clone());
@@ -774,8 +852,19 @@ impl QuicServer {
                 addr: from,
                 cids: Vec::new(),
                 initial_routes: Vec::new(),
+                half_open: true,
             },
         );
+        self.half_open += 1;
+        // Sweep the eviction queue once stale ids outnumber live ones, so
+        // it stays proportional to the half-open population (amortised
+        // O(1) per accept).
+        if self.half_open_order.len() > 2 * self.half_open + 64 {
+            let conns = &self.conns;
+            self.half_open_order
+                .retain(|id| conns.get(id).is_some_and(|h| h.half_open));
+        }
+        self.half_open_order.push_back(id);
         self.feed(id, from, ecn, datagram);
         Ok(())
     }
@@ -866,23 +955,36 @@ impl QuicServer {
         }
     }
 
-    /// Drops the oldest half-open connection, returning whether one was
-    /// found. Oldest-first: it is the one whose peer has had the longest to
-    /// prove itself and has not.
+    /// Evicts the oldest half-open connection(s) until the half-open count
+    /// is back under `max_half_open`, returning whether it is. Oldest-first:
+    /// it is the one whose peer has had the longest to prove itself and has
+    /// not (and if any half-open connection has outlived
+    /// [`HALF_OPEN_TIMEOUT`], the oldest has).
+    ///
+    /// Works from `half_open_order` instead of searching the table; ids of
+    /// connections that have validated or gone since they were queued are
+    /// discarded on the way.
     fn evict_oldest_half_open(&mut self) -> bool {
-        let victim = self
-            .conns
-            .iter()
-            .filter(|(_, h)| Self::is_half_open(h))
-            .min_by_key(|(_, h)| h.conn.started_at())
-            .map(|(&id, _)| id);
-        match victim {
-            Some(id) => {
-                self.remove_conn(id);
-                true
+        while self.half_open >= self.max_half_open {
+            let Some(id) = self.half_open_order.pop_front() else {
+                return false;
+            };
+            let Some(h) = self.conns.get_mut(&id) else {
+                continue;
+            };
+            if !h.half_open {
+                continue;
             }
-            None => false,
+            if !Self::is_half_open(h) {
+                // Validated without the router noticing (the host fed it
+                // directly): not a candidate, and not half-open any more.
+                h.half_open = false;
+                self.half_open -= 1;
+                continue;
+            }
+            self.remove_conn(id);
         }
+        true
     }
 
     /// Removes a hosted connection and every routing entry pointing at it.
@@ -890,10 +992,56 @@ impl QuicServer {
         let Some(h) = self.conns.remove(&id) else {
             return;
         };
-        self.by_cid.retain(|_, v| *v != id);
-        self.by_addr.retain(|_, v| *v != id);
+        if h.half_open {
+            self.half_open -= 1;
+        }
+        // Each table is cleared by the keys this connection is known to
+        // hold in it, not by a walk over every entry: `h.cids` is what
+        // `refresh_cid_routes` last routed, `h.addr` the only address
+        // `feed` leaves claimed, `h.initial_routes` the pre-handshake keys.
+        // A key another connection has since taken over is left alone.
+        for cid in &h.cids {
+            if self.by_cid.get(cid) == Some(&id) {
+                self.by_cid.remove(cid);
+            }
+        }
+        if self.by_addr.get(&h.addr) == Some(&id) {
+            self.by_addr.remove(&h.addr);
+        }
         for key in h.initial_routes {
             self.unroute_initial(key, id);
+        }
+        #[cfg(test)]
+        self.assert_tables_consistent(Some(id));
+    }
+
+    /// Test check of the bookkeeping the router keeps instead of walking
+    /// its tables: no routing entry names a connection that is gone (in
+    /// particular `removed`), the running half-open count matches a
+    /// recount of the flags, and every flagged connection is queued for
+    /// eviction.
+    #[cfg(test)]
+    fn assert_tables_consistent(&self, removed: Option<u64>) {
+        let live = |id: &u64| self.conns.contains_key(id) && Some(*id) != removed;
+        assert!(self.by_cid.values().all(live), "stale by_cid entry");
+        assert!(self.by_addr.values().all(live), "stale by_addr entry");
+        assert!(self.by_initial.values().all(live), "stale by_initial entry");
+        for cid in self.by_initial.keys().map(|(_, c)| c) {
+            let n = self.by_initial.keys().filter(|(_, c)| c == cid).count();
+            assert_eq!(self.initial_cid_refs.get(cid), Some(&n));
+        }
+        assert_eq!(
+            self.initial_cid_refs.values().sum::<usize>(),
+            self.by_initial.len()
+        );
+        let flagged = self.conns.values().filter(|h| h.half_open).count();
+        assert_eq!(self.half_open, flagged, "half-open count drifted");
+        for (id, h) in &self.conns {
+            assert!(
+                !Self::is_half_open(h) || h.half_open,
+                "an unvalidated connection is always flagged"
+            );
+            assert!(!h.half_open || self.half_open_order.contains(id));
         }
     }
 }
@@ -1898,6 +2046,185 @@ mod server_tests {
         let server_scid = conn.cid_pair_for_test().1;
         assert_eq!(c.cid_pair_for_test().0, server_scid);
         assert_ne!(server_scid, retry_scid);
+    }
+
+    /// `poll_transmit` used to walk the connection table from the start for
+    /// every datagram it returned, so draining a burst cost (datagrams ×
+    /// connections) polls. It resumes where it stopped: one lap to collect
+    /// everything, one more to find nothing left — and it still asks every
+    /// connection before reporting that there is nothing to send.
+    #[test]
+    fn poll_transmit_resumes_instead_of_rescanning() {
+        const N: u64 = 48;
+        let (_, cert) = server_identity();
+        let mut srv = server([0x71; 32]);
+        let mut first_client = None;
+        for i in 0..N {
+            let mut c = client(&cert);
+            let dg = c.pop_datagram();
+            srv.recv(addr(44000 + i as u16), EcnCodepoint::NotEct, &dg)
+                .unwrap();
+            first_client.get_or_insert(c);
+        }
+        let mut first_client = first_client.unwrap();
+        assert_eq!(srv.connection_count() as u64, N);
+        // Start somewhere in the middle of the table, as after earlier use.
+        srv.tx_cursor = srv.next_id / 2;
+        srv.tx_polls = 0;
+        let mut datagrams = 0u64;
+        let mut served = std::collections::HashSet::new();
+        while let Some((to, _, d)) = srv.poll_transmit() {
+            datagrams += 1;
+            served.insert(to);
+            if to == addr(44000) {
+                first_client.feed_datagram_from(addr(443), &d).unwrap();
+            }
+        }
+        assert_eq!(served.len() as u64, N, "every connection sent its flight");
+        assert!(datagrams >= N);
+        assert!(
+            srv.tx_polls <= datagrams + 3 * N,
+            "{} polls for {datagrams} datagrams over {N} connections",
+            srv.tx_polls
+        );
+        // Nothing is skipped: a connection behind the cursor that gains
+        // something to send is found by the very next call.
+        let first = *srv.conns.keys().next().unwrap();
+        assert!(srv.tx_cursor > first);
+        loop {
+            let d = first_client.pop_datagram();
+            if d.is_empty() {
+                break;
+            }
+            srv.recv(addr(44000), EcnCodepoint::NotEct, &d).unwrap();
+        }
+        let (to, _, _) = srv.poll_transmit().expect("the server's reply");
+        assert_eq!(to, addr(44000));
+        assert_eq!(srv.tx_cursor, first);
+    }
+
+    /// The half-open budget is checked on every unrecognised Initial. It
+    /// used to recount (and, at the limit, search) the whole connection
+    /// table each time; it now reads a running count and evicts from a
+    /// queue. The count must track the truth through accepts, validation,
+    /// eviction, reaping and removal, and the queue must stay bounded.
+    #[test]
+    fn half_open_count_tracks_without_recounting() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x72; 32]);
+        srv.set_max_half_open(4);
+        let check = |srv: &QuicServer| {
+            srv.assert_tables_consistent(None);
+            assert_eq!(srv.half_open, srv.half_open_count());
+            assert!(srv.half_open <= srv.max_half_open());
+            assert!(srv.half_open_order.len() <= 2 * srv.half_open + 65);
+        };
+
+        // One client completes its handshake: it stops counting.
+        let (ca, sa) = (addr(45000), addr(443));
+        let mut c = client(&cert);
+        drive_router(&mut srv, &mut c, ca);
+        check(&srv);
+        assert_eq!(srv.half_open, 0);
+        let established = *srv.conns.keys().next().unwrap();
+
+        // A long flood of spoofed Initials: the count sits at the budget,
+        // the oldest half-open connection makes way each time, the
+        // established one is never touched.
+        for i in 0..300u16 {
+            let mut spoof = client(&cert);
+            let dg = spoof.pop_datagram();
+            srv.recv(addr(46000 + i), EcnCodepoint::NotEct, &dg)
+                .unwrap();
+            while srv.poll_transmit().is_some() {}
+            check(&srv);
+            assert_eq!(srv.half_open, (i as usize + 1).min(4));
+            let oldest_half_open = srv
+                .conns
+                .iter()
+                .find(|(_, h)| h.half_open)
+                .map(|(&id, _)| id)
+                .unwrap();
+            assert_eq!(
+                oldest_half_open,
+                established + (i as u64 + 1).saturating_sub(3).max(1),
+                "eviction is oldest-first"
+            );
+        }
+        assert!(srv.conns.contains_key(&established));
+        assert_eq!(srv.connection_count(), 5);
+
+        // A half-open connection the host validates behind the router's
+        // back is not evicted in place of a genuinely half-open one, and
+        // the count catches up.
+        let ids: Vec<u64> = srv
+            .conns
+            .keys()
+            .copied()
+            .filter(|&i| i != established)
+            .collect();
+        let mut c2 = client(&cert);
+        let first = c2.pop_datagram();
+        srv.recv(addr(47000), EcnCodepoint::NotEct, &first).unwrap();
+        check(&srv);
+        let newest = *srv.conns.keys().next_back().unwrap();
+        assert!(!srv.conns.contains_key(&ids[0]), "the oldest made way");
+        // Finish that handshake by feeding the connection directly.
+        for _ in 0..16 {
+            let conn = &mut srv.conns.get_mut(&newest).unwrap().conn;
+            loop {
+                let d = conn.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                c2.feed_datagram_from(sa, &d).unwrap();
+            }
+            loop {
+                let d = c2.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                conn.feed_datagram_from(addr(47000), &d).unwrap();
+            }
+            if conn.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(srv.conns[&newest].conn.is_handshake_complete());
+        // The router has not noticed yet: its count errs on the high side
+        // (it would evict a little early, never admit too many) until the
+        // next timer pass brings it back in line.
+        assert_eq!(srv.half_open, 4);
+        assert_eq!(srv.half_open_count(), 3);
+        srv.on_timeout();
+        check(&srv);
+        assert_eq!(srv.half_open, 3);
+        // So the next arrival needs no eviction.
+        let before: Vec<u64> = srv.conns.keys().copied().collect();
+        let mut spoof = client(&cert);
+        let dg = spoof.pop_datagram();
+        srv.recv(addr(47001), EcnCodepoint::NotEct, &dg).unwrap();
+        check(&srv);
+        assert!(before.iter().all(|id| srv.conns.contains_key(id)));
+        assert_eq!(srv.half_open, 4);
+
+        // The half-open timer reaps them all; the count returns to zero.
+        let past = Instant::now() - Duration::from_secs(11);
+        for h in srv.conns.values_mut().filter(|h| h.half_open) {
+            h.conn.set_start_for_test(past);
+        }
+        srv.on_timeout();
+        check(&srv);
+        assert_eq!(srv.half_open, 0);
+        assert_eq!(srv.connection_count(), 2);
+
+        // With a budget of zero nothing unvalidated is ever accepted.
+        srv.set_max_half_open(0);
+        let mut spoof = client(&cert);
+        let dg = spoof.pop_datagram();
+        srv.recv(addr(47002), EcnCodepoint::NotEct, &dg).unwrap();
+        check(&srv);
+        assert_eq!(srv.connection_count(), 2);
     }
 
     /// A short-header (1-RTT-shaped) packet for a Connection ID the server has
