@@ -1126,7 +1126,9 @@ pub unsafe extern "C" fn pc_tls_send(
 /// EOF. Plaintext received before the close_notify is always delivered
 /// first. A transport EOF observed *without* this status means the stream
 /// was truncated (RFC 8446 §6.1); see [`pc_tls_received_close_notify`].
-/// DTLS engines never report `Closed` (no close_notify exchange).
+/// DTLS engines report `Closed` the same way, once the peer's close_notify
+/// (a protected record) has been authenticated; a datagram transport has
+/// no EOF and the alert can be lost, so its absence proves nothing there.
 ///
 /// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
 /// zero capacity) is non-destructive: the plaintext is retained and re-served
@@ -1173,7 +1175,9 @@ pub unsafe extern "C" fn pc_tls_recv(
 /// otherwise, and -1 when `tls` is NULL. After a transport EOF, 0 means the
 /// peer (or an on-path attacker injecting a FIN/RST) cut the stream without
 /// the closure alert — a truncation attack for EOF-delimited application
-/// framing. Always 0 for DTLS engines.
+/// framing. DTLS engines report the peer's authenticated close_notify the
+/// same way; since datagrams can be lost (and there is no transport EOF),
+/// 0 on DTLS does not mean the peer is still there.
 ///
 /// # Safety
 /// `tls` valid.
@@ -1464,10 +1468,18 @@ pub unsafe extern "C" fn pc_tls_peer_certificate(
     unsafe { settle_out_len(out_len, st) }
 }
 
-/// Queues a close_notify (TLS; DTLS engines exchange none) and marks the
-/// handle closed: every later [`pc_tls_send`] returns [`PcStatus::Closed`].
-/// Drain the alert with [`pc_tls_pop`]. Plaintext the peer sent before its
-/// own close_notify stays readable through [`pc_tls_recv`]. Idempotent.
+/// Queues a close_notify and marks the handle closed: every later
+/// [`pc_tls_send`] returns [`PcStatus::Closed`]. Drain the alert with
+/// [`pc_tls_pop`]. Plaintext the peer sent before its own close_notify
+/// stays readable through [`pc_tls_recv`]. Idempotent.
+///
+/// DTLS engines send the close_notify too, as one protected record — so
+/// only once the handshake has completed: before that nothing is queued
+/// (a plaintext alert would be spoofable) and the handle is just marked
+/// closed. A DTLS 1.3 client holds the alert back while
+/// [`pc_dtls_handshake_flight_pending`] reports 1; keep driving the
+/// connection until it turns 0, then pop and send it. The alert is a
+/// single datagram and is not retransmitted.
 ///
 /// # Safety
 /// `tls` valid.

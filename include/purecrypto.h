@@ -873,16 +873,23 @@ pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
 pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);
 /* PC_CLOSED (with *out_len == 0) once no plaintext is pending AND the
  * peer's close_notify has been processed — the TLS-level EOF. Plaintext
- * received before the close_notify is always delivered first. Never
- * PC_CLOSED for DTLS (no close_notify exchange). */
+ * received before the close_notify is always delivered first. DTLS
+ * reports PC_CLOSED the same way once the peer's close_notify (a protected
+ * record) has been authenticated; a datagram transport has no EOF and the
+ * alert can be lost, so its absence proves nothing there. */
 pc_status pc_tls_recv(PcTls *tls, uint8_t *app_out, size_t *out_len);
 /* PC_OK complete, PC_WANT_WRITE / PC_WANT_READ to keep pumping, PC_TLS_ALERT
  * / PC_CLOSED / PC_INTERNAL on engine failure (see pc_tls_feed). */
 pc_status pc_tls_handshake(PcTls *tls);
-/* Queues a close_notify (TLS; DTLS exchanges none) and marks the handle
- * closed: every later pc_tls_send returns PC_CLOSED. Drain the alert with
- * pc_tls_pop; plaintext the peer sent before its own close_notify stays
- * readable through pc_tls_recv. Idempotent. */
+/* Queues a close_notify and marks the handle closed: every later
+ * pc_tls_send returns PC_CLOSED. Drain the alert with pc_tls_pop; plaintext
+ * the peer sent before its own close_notify stays readable through
+ * pc_tls_recv. Idempotent.
+ * DTLS sends the close_notify too, as one protected record — so only once
+ * the handshake has completed: before that nothing is queued (a plaintext
+ * alert would be spoofable) and the handle is just marked closed. A DTLS 1.3
+ * client holds the alert back while pc_dtls_handshake_flight_pending reports
+ * 1 (see there). The alert is a single datagram and is not retransmitted. */
 pc_status pc_tls_close(PcTls *tls);
 /* Aborts with a fatal alert of code `alert` (48 unknown_ca, 42
  * bad_certificate, 45 certificate_expired, ...) — e.g. after the caller's
@@ -893,8 +900,10 @@ pc_status pc_tls_close(PcTls *tls);
  * returns PC_CLOSED. Idempotent. PC_UNSUPPORTED on DTLS. */
 pc_status pc_tls_abort(PcTls *tls, uint8_t alert);
 /* 1 once the peer's close_notify has been processed, 0 otherwise, -1 on a
- * NULL handle. A transport EOF with 0 here is a truncated stream. Always 0
- * for DTLS. */
+ * NULL handle. A transport EOF with 0 here is a truncated stream. DTLS
+ * reports the peer's authenticated close_notify the same way; since
+ * datagrams can be lost (and there is no transport EOF), 0 on DTLS does not
+ * mean the peer is still there. */
 int pc_tls_received_close_notify(const PcTls *tls);
 /* TLS 1.2 renegotiation: a client sends a new ClientHello, a server a
  * HelloRequest; keep pumping pc_tls_pop / pc_tls_feed (pc_tls_send data is
