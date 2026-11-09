@@ -459,6 +459,16 @@ pub struct StoredSession12 {
     /// `0` means the server gave no hint and the ticket has no client-side
     /// expiry.
     pub lifetime_seconds: u32,
+    /// SHA-256 of the server's leaf certificate (the bare SPKI for a raw
+    /// public key) as authenticated by the full handshake this session
+    /// descends from. An abbreviated handshake carries no certificate, so
+    /// this is what a renegotiation of the *resumed* connection is held to
+    /// (the same-certificate check of
+    /// [`RenegotiationPolicy`](crate::tls::RenegotiationPolicy)). `None`
+    /// when unknown — a session that came from a DTLS connection, which
+    /// does not renegotiate — in which case the resumed connection is not
+    /// renegotiated unless the policy allows the certificate to change.
+    pub server_leaf_sha256: Option<[u8; 32]>,
 }
 
 impl StoredSession12 {
@@ -504,6 +514,7 @@ impl core::fmt::Debug for StoredSession12 {
             .field("server_name", &self.server_name)
             .field("verify_certificates", &self.verify_certificates)
             .field("lifetime_seconds", &self.lifetime_seconds)
+            .field("server_leaf_sha256", &self.server_leaf_sha256.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -842,6 +853,10 @@ pub struct ClientConnection12 {
     cert_chain: Vec<Vec<u8>>,
     /// Peer leaf public key, extracted from the leaf cert (verified or raw).
     leaf_key: Option<AnyPublicKey>,
+    /// On a resumed handshake, the stored session's
+    /// [`server_leaf_sha256`](StoredSession12::server_leaf_sha256): the
+    /// identity pin of a connection that saw no `Certificate` message.
+    resumed_leaf_pin: Option<[u8; 32]>,
     /// The `SignatureScheme` the peer's handshake signature carried and
     /// verified under, for the negotiated-parameter report. `None` until
     /// then.
@@ -1107,6 +1122,7 @@ impl ClientConnection12 {
             legacy_rng,
             cert_chain: Vec::new(),
             leaf_key: None,
+            resumed_leaf_pin: None,
             peer_signature_scheme: None,
             offered_sig_schemes,
             peer_share: None,
@@ -1273,6 +1289,7 @@ impl ClientConnection12 {
             legacy_rng,
             cert_chain: Vec::new(),
             leaf_key: None,
+            resumed_leaf_pin: None,
             peer_signature_scheme: None,
             offered_sig_schemes,
             peer_share: None,
@@ -1565,7 +1582,18 @@ impl ClientConnection12 {
             server_name: self.server_name.clone(),
             verify_certificates: self.config.verify_certificates,
             lifetime_seconds: self.received_ticket_lifetime,
+            server_leaf_sha256: self.server_leaf_pin(),
         })
+    }
+
+    /// The identity pin of the current session's server: SHA-256 of the
+    /// leaf its `Certificate` message carried, or — on a resumed session,
+    /// which has none — the pin the stored session brought along.
+    fn server_leaf_pin(&self) -> Option<[u8; 32]> {
+        match self.cert_chain.first() {
+            Some(leaf) => Some(crate::tls::reneg::leaf_pin(leaf)),
+            None => self.resumed_leaf_pin,
+        }
     }
 
     /// `true` if this handshake resumed a prior session via RFC 5077.
@@ -2277,6 +2305,14 @@ impl ClientConnection12 {
     /// Extended Master Secret (RFC 7627 §6.2 — the triple-handshake defence
     /// this engine requires of every renegotiation), with no renegotiation
     /// already in flight and our side still open.
+    ///
+    /// And one whose server identity is on record, unless the policy
+    /// allows the certificate to change: a session resumed from a ticket
+    /// ran no `Certificate` message, so the same-certificate check a
+    /// renegotiation owes the application (RFC 7627 §6.2) rests on the pin
+    /// its [`StoredSession12`] carried. Without one there is nothing to
+    /// compare the new leaf against, and the session is not renegotiated
+    /// rather than renegotiated unchecked.
     fn renegotiation_eligible(&self) -> bool {
         #[cfg(feature = "tls-legacy")]
         if self.legacy_suite.is_some() {
@@ -2290,6 +2326,8 @@ impl ClientConnection12 {
             && self.ems_negotiated
             && self.reneg.client_verify_data.len() == 12
             && self.reneg_rng.is_some()
+            && (self.config.renegotiation.allow_peer_certificate_change
+                || self.server_leaf_pin().is_some())
     }
 
     /// Starts a client-initiated TLS 1.2 renegotiation (RFC 5746): queues a
@@ -2303,7 +2341,11 @@ impl ClientConnection12 {
     /// [`ClientConfig12::renegotiation`] is enabled and the session is
     /// eligible: connected, TLS 1.2 with an AEAD suite (not a `tls-legacy`
     /// version), Extended Master Secret negotiated, no renegotiation
-    /// already in flight, and no `close_notify` sent.
+    /// already in flight, and no `close_notify` sent. A session resumed
+    /// from a ticket is held to the certificate of the handshake that
+    /// issued the ticket; one whose stored form carries no such pin is
+    /// eligible only when the policy sets
+    /// [`allow_peer_certificate_change`](crate::tls::RenegotiationPolicy::allow_peer_certificate_change).
     pub fn renegotiate(&mut self) -> Result<(), Error> {
         if !self.config.renegotiation.enabled || !self.renegotiation_eligible() {
             return Err(Error::InappropriateState);
@@ -2336,6 +2378,8 @@ impl ClientConnection12 {
         self.p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
+        // What the new handshake's certificate is held to.
+        let pin = self.server_leaf_pin();
         let prev = ReplacedSession {
             suite: self.suite,
             master: self.master.take(),
@@ -2352,7 +2396,7 @@ impl ClientConnection12 {
         self.client_random = random;
 
         self.reneg.active = true;
-        self.reneg.prev_peer_leaf = prev.cert_chain.first().cloned();
+        self.reneg.prev_peer_leaf = pin;
         self.replaced = Some(prev);
         self.state = State::WaitServerHello;
         self.transcript = Transcript::new();
@@ -2691,6 +2735,9 @@ impl ClientConnection12 {
             let sr = sh.random;
             self.master = Some(stored.master_secret);
             self.resumed = true;
+            // No Certificate on this path: the identity a renegotiation
+            // will be held to is the one the stored session remembers.
+            self.resumed_leaf_pin = stored.server_leaf_sha256;
 
             if let Some(kl) = self.config.key_log.as_ref() {
                 kl.log("CLIENT_RANDOM", &cr, &stored.master_secret);
@@ -2823,8 +2870,15 @@ impl ClientConnection12 {
         // A renegotiation must not switch the server's identity (RFC 7627
         // §6.2's application-level triple-handshake defence) unless the
         // policy allows it.
-        self.reneg
-            .check_peer_leaf(&self.config.renegotiation, chain.first().map(Vec::as_slice))?;
+        // A server is never anonymous: with no leaf (or, for a resumed
+        // session, stored pin) on record for the replaced session there
+        // is nothing to compare, and the check fails closed (see
+        // `renegotiation_eligible`).
+        self.reneg.check_peer_leaf(
+            &self.config.renegotiation,
+            chain.first().map(Vec::as_slice),
+            false,
+        )?;
 
         self.cert_chain = chain;
         self.leaf_key = Some(leaf_key);
@@ -4843,6 +4897,7 @@ mod tests {
             server_name: String::from("example.com"),
             verify_certificates: true,
             lifetime_seconds: 0,
+            server_leaf_sha256: None,
         }
     }
 

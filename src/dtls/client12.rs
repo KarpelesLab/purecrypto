@@ -557,6 +557,8 @@ impl DtlsClientConnection12 {
             server_name: self.config.server_name.clone(),
             verify_certificates: self.config.verify_certificates,
             lifetime_seconds,
+            // DTLS 1.2 does not renegotiate; the pin is a TLS-only input.
+            server_leaf_sha256: None,
         })
     }
 

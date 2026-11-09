@@ -1800,7 +1800,10 @@ impl<R: RngCore> ServerConnection12<R> {
             resumed: self.resumed,
             ems_negotiated: self.ems_negotiated,
         };
-        self.reneg.prev_peer_leaf = prev.client_cert_chain.first().cloned();
+        self.reneg.prev_peer_leaf = prev
+            .client_cert_chain
+            .first()
+            .map(|leaf| crate::tls::reneg::leaf_pin(leaf));
         self.replaced = Some(prev);
         // The record-size limits are re-decided by the new hello (none
         // unless it offers one again, RFC 8449 §4).
@@ -3152,8 +3155,12 @@ impl<R: RngCore> ServerConnection12<R> {
             .ok_or(Error::InappropriateState)?;
         // A renegotiation must not switch (or drop) the client identity the
         // replaced handshake authenticated, unless the policy allows it.
-        self.reneg
-            .check_peer_leaf(&self.config.renegotiation, chain.first().map(Vec::as_slice))?;
+        // A client that was anonymous before may authenticate now.
+        self.reneg.check_peer_leaf(
+            &self.config.renegotiation,
+            chain.first().map(Vec::as_slice),
+            true,
+        )?;
         if chain.is_empty() {
             if policy.required {
                 return Err(Error::CertificateRequired);

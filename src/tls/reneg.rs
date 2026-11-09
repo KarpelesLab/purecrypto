@@ -22,7 +22,14 @@
 //!   symptom of the attack, and no application expects it. A peer that
 //!   did not authenticate on the earlier handshake (a client without a
 //!   certificate) may present one on the renegotiation — the
-//!   "certificate on demand" use of renegotiation.
+//!   "certificate on demand" use of renegotiation. That allowance is the
+//!   server's alone: a server always authenticates. A client session
+//!   *resumed* from a ticket ran no `Certificate` message, so the stored
+//!   session carries the SHA-256 of the leaf its originating handshake
+//!   authenticated and the renegotiation is held to that. A resumed
+//!   session with no such pin on record is not renegotiated by the client
+//!   at all unless certificate change is allowed: `renegotiate()` is
+//!   refused and a `HelloRequest` is declined with `no_renegotiation`.
 //!
 //! Declining is rate-limited too, whatever the policy. A server answers at
 //! most [`DECLINE_LIMIT`] refused requests (4 per 300 s, a plain 4 per
@@ -148,6 +155,10 @@ pub struct RenegotiationPolicy {
     /// the renegotiation fails with
     /// [`Error::PeerCertificateChanged`](crate::tls::Error::PeerCertificateChanged).
     /// The new chain is always fully verified either way.
+    ///
+    /// On a client session resumed from a ticket, "before" is the
+    /// certificate of the handshake that issued the ticket (the stored
+    /// session remembers its SHA-256).
     pub allow_peer_certificate_change: bool,
 }
 
@@ -278,10 +289,13 @@ pub(crate) struct RenegState {
     pub(crate) server_verify_data: Vec<u8>,
     /// A renegotiation handshake is in flight.
     pub(crate) active: bool,
-    /// The peer's leaf certificate on the handshake being replaced (`None`
-    /// when the peer did not authenticate), checked against the one the
-    /// renegotiation presents.
-    pub(crate) prev_peer_leaf: Option<Vec<u8>>,
+    /// The SHA-256 ([`leaf_pin`]) of the peer's leaf certificate on the
+    /// handshake being replaced (`None` when the peer did not
+    /// authenticate), checked against the one the renegotiation presents.
+    /// A digest rather than the certificate so that a client session
+    /// resumed from a ticket — which only remembers the digest — is held
+    /// to the same check.
+    pub(crate) prev_peer_leaf: Option<[u8; 32]>,
     /// Completed renegotiations.
     pub(crate) completed: u32,
     /// Application data the caller sent while the renegotiation was in
@@ -341,21 +355,42 @@ impl RenegState {
     }
 
     /// On a renegotiation, refuses a peer leaf that differs from the one the
-    /// replaced handshake authenticated (unless the policy allows it). A
-    /// peer that was anonymous before may authenticate now.
+    /// replaced handshake authenticated (unless the policy allows it).
+    ///
+    /// `anonymous_before_ok` says what a replaced handshake *without* a
+    /// peer leaf means. A server passes `true`: its client was anonymous
+    /// and may authenticate now ("certificate on demand"). A client passes
+    /// `false`: a server is never anonymous, so a missing leaf means the
+    /// identity to compare against is simply not known (a resumed session
+    /// whose stored form carried no pin), and accepting whatever leaf
+    /// shows up would skip the check — the renegotiation is refused
+    /// instead. (The client does not start one in that state; this is the
+    /// backstop.)
     pub(crate) fn check_peer_leaf(
         &self,
         policy: &RenegotiationPolicy,
         new_leaf: Option<&[u8]>,
+        anonymous_before_ok: bool,
     ) -> Result<(), crate::tls::Error> {
         if !self.active || policy.allow_peer_certificate_change {
             return Ok(());
         }
-        match self.prev_peer_leaf.as_deref() {
-            Some(prev) if new_leaf != Some(prev) => Err(crate::tls::Error::PeerCertificateChanged),
-            _ => Ok(()),
+        match self.prev_peer_leaf.as_ref() {
+            Some(prev) if new_leaf.map(leaf_pin).as_ref() == Some(prev) => Ok(()),
+            None if anonymous_before_ok => Ok(()),
+            _ => Err(crate::tls::Error::PeerCertificateChanged),
         }
     }
+}
+
+/// The identity pin a renegotiation is held to: SHA-256 of the peer's leaf
+/// certificate (DER; the bare `SubjectPublicKeyInfo` for an RFC 7250 raw
+/// public key), as it appeared in the `Certificate` message.
+pub(crate) fn leaf_pin(leaf: &[u8]) -> [u8; 32] {
+    use crate::hash::Digest;
+    let mut pin = [0u8; 32];
+    pin.copy_from_slice(crate::hash::Sha256::digest(leaf).as_ref());
+    pin
 }
 
 /// Wall-clock seconds for the limiter, when the build has a clock.

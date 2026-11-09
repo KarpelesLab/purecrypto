@@ -991,3 +991,191 @@ fn solicited_then_declined_renegotiations_are_bounded() {
     client.renegotiate().unwrap();
     assert!(client.is_renegotiating());
 }
+
+/// A ticket-issuing server config (identity `a`), renegotiation enabled.
+fn ticket_server() -> (ServerConfig12, Vec<u8>) {
+    let (cfg, der) = ecdsa_server12(b"reneg-server-key-a");
+    let mut cfg = cfg
+        .with_ticket_key([0x42; 32])
+        .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0));
+    cfg.renegotiation = enabled();
+    (cfg, der)
+}
+
+/// A client for [`ticket_server`], optionally resuming `session`.
+fn ticket_client(
+    trust: RootCertStore,
+    policy: RenegotiationPolicy,
+    session: Option<crate::tls::conn::StoredSession12>,
+    label: &[u8],
+) -> ClientConnection12 {
+    let mut cfg: ClientConfig12 = client_config12(trust);
+    if let Some(s) = session {
+        cfg = cfg.with_session(s);
+    }
+    cfg.renegotiation = policy;
+    let mut rng = HmacDrbg::<Sha256>::new(label, b"nonce", &[]);
+    ClientConnection12::new_with_offer(
+        cfg,
+        "loopback.example",
+        &mut rng,
+        &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+        &[NamedGroup::X25519],
+    )
+}
+
+/// A resumed session and its server: a full handshake against
+/// [`ticket_server`], then a second connection resuming the ticket (with
+/// `edit` applied to the stored session first).
+fn resumed_pair(
+    policy: RenegotiationPolicy,
+    edit: impl FnOnce(&mut crate::tls::conn::StoredSession12),
+) -> (ClientConnection12, Server, Vec<u8>) {
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f4-s1");
+    let mut client = ticket_client(roots(&der), policy.clone(), None, b"reneg-f4-c1");
+    pump_ok(&mut client, &mut server);
+    let mut session = client.take_session().expect("the server issued a ticket");
+    assert_eq!(
+        session.server_leaf_sha256,
+        Some(crate::tls::reneg::leaf_pin(&der))
+    );
+    edit(&mut session);
+
+    let (cfg, _) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f4-s2");
+    let mut trust = roots(&der);
+    trust
+        .add_der(ecdsa_server12(b"reneg-server-key-b").1)
+        .unwrap();
+    let mut client = ticket_client(trust, policy, Some(session), b"reneg-f4-c2");
+    pump_ok(&mut client, &mut server);
+    assert!(client.did_resume() && server.did_resume());
+    assert!(client.peer_certificates().is_empty());
+    (client, server, der)
+}
+
+/// A session resumed from a ticket ran no `Certificate` message, but the
+/// same-certificate check still applies to its renegotiation: the stored
+/// session remembers the leaf its originating handshake authenticated. The
+/// same certificate is accepted (and the pin carried into the next stored
+/// session); another one — trusted or not — is `PeerCertificateChanged`.
+#[test]
+fn resumed_client_session_pins_the_original_server_certificate() {
+    // Same certificate: the renegotiation completes.
+    let (mut client, mut server, der) = resumed_pair(enabled(), |_| {});
+    client.renegotiate().unwrap();
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.renegotiation_count(), 1);
+    assert!(!client.did_resume());
+    assert_eq!(client.peer_certificates(), &[der][..]);
+
+    // A different (equally trusted) certificate: refused.
+    let (mut client, mut server, _) = resumed_pair(enabled(), |_| {});
+    let (mut next, _) = ecdsa_server12(b"reneg-server-key-b");
+    next.renegotiation = enabled();
+    server.test_replace_config(next);
+    client.renegotiate().unwrap();
+    let (c, _s) = pump(&mut client, &mut server);
+    assert_eq!(c, Err(Error::PeerCertificateChanged));
+
+    // ... unless the policy allows the change.
+    let policy = enabled().with_peer_certificate_change(true);
+    let (mut client, mut server, _) = resumed_pair(policy, |_| {});
+    let (mut next, der_b) = ecdsa_server12(b"reneg-server-key-b");
+    next.renegotiation = enabled();
+    server.test_replace_config(next);
+    client.renegotiate().unwrap();
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.peer_certificates(), &[der_b][..]);
+
+    // The pin survives a chain of resumptions: a session taken from a
+    // resumed connection still carries the original leaf's digest.
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f4-s3");
+    let mut client = ticket_client(roots(&der), enabled(), None, b"reneg-f4-c3");
+    pump_ok(&mut client, &mut server);
+    let first = client.take_session().unwrap();
+    let (cfg, _) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f4-s4");
+    let mut client = ticket_client(roots(&der), enabled(), Some(first), b"reneg-f4-c4");
+    pump_ok(&mut client, &mut server);
+    assert!(client.did_resume());
+    if let Some(second) = client.take_session() {
+        assert_eq!(
+            second.server_leaf_sha256,
+            Some(crate::tls::reneg::leaf_pin(&der))
+        );
+    }
+}
+
+/// A resumed session whose stored form carries no pin gives the client
+/// nothing to hold a renegotiation's certificate to. Unless the policy
+/// allows the certificate to change, the client does not renegotiate such a
+/// session: `renegotiate()` is refused, a HelloRequest is declined, and the
+/// session carries on.
+#[test]
+fn resumed_client_session_without_a_pin_is_not_renegotiated() {
+    for allow in [false, true] {
+        let policy = enabled().with_peer_certificate_change(allow);
+        let (mut client, mut server, der) = resumed_pair(policy, |s| s.server_leaf_sha256 = None);
+        if allow {
+            client.renegotiate().unwrap();
+            pump_ok(&mut client, &mut server);
+            assert_eq!(client.renegotiation_count(), 1);
+            assert_eq!(client.peer_certificates(), &[der][..]);
+        } else {
+            assert_eq!(client.renegotiate(), Err(Error::InappropriateState));
+            assert!(!client.is_renegotiating());
+            // The server asks: declined with a warning, nothing changes.
+            server.renegotiate().unwrap();
+            pump_ok(&mut client, &mut server);
+            assert_eq!(client.renegotiation_count(), 0);
+            assert_eq!(server.renegotiation_count(), 0);
+            assert!(!server.is_renegotiating());
+            server.send_application_data(b"still up").unwrap();
+            pump_ok(&mut client, &mut server);
+            assert_eq!(client.take_received_plaintext(), b"still up");
+        }
+    }
+}
+
+/// The backstop behind that: `check_peer_leaf` on a client fails closed
+/// when the replaced session has no leaf on record, where a server treats
+/// the same state as a client that was anonymous before.
+#[test]
+fn missing_previous_leaf_is_only_acceptable_to_a_server() {
+    use crate::tls::reneg::{RenegState, leaf_pin};
+    let state = RenegState {
+        active: true,
+        ..RenegState::default()
+    };
+    let policy = enabled();
+    assert_eq!(state.check_peer_leaf(&policy, Some(b"leaf"), true), Ok(()));
+    assert_eq!(
+        state.check_peer_leaf(&policy, Some(b"leaf"), false),
+        Err(Error::PeerCertificateChanged)
+    );
+    let lenient = enabled().with_peer_certificate_change(true);
+    assert_eq!(
+        state.check_peer_leaf(&lenient, Some(b"leaf"), false),
+        Ok(())
+    );
+
+    let pinned = RenegState {
+        active: true,
+        prev_peer_leaf: Some(leaf_pin(b"leaf")),
+        ..RenegState::default()
+    };
+    for role in [true, false] {
+        assert_eq!(pinned.check_peer_leaf(&policy, Some(b"leaf"), role), Ok(()));
+        assert_eq!(
+            pinned.check_peer_leaf(&policy, Some(b"other"), role),
+            Err(Error::PeerCertificateChanged)
+        );
+        assert_eq!(
+            pinned.check_peer_leaf(&policy, None, role),
+            Err(Error::PeerCertificateChanged)
+        );
+    }
+}

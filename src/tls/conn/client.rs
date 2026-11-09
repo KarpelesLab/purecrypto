@@ -5888,6 +5888,7 @@ mod tests {
             server_name: String::from(name),
             verify_certificates: true,
             lifetime_seconds: 0,
+            server_leaf_sha256: None,
         }
     }
 
