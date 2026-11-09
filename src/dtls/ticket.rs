@@ -106,12 +106,34 @@ pub(crate) fn seal_key(
 /// then neither issued nor accepted rather than minted with a
 /// `creation_time` of 0, which could never expire and would turn every
 /// ticket into a permanent bearer token.
+///
+/// Callers that treat the reading as *advancing* time — the 0-RTT
+/// anti-replay logic — must use [`ticket_clock`] instead, which also says
+/// whether the clock is live.
 pub(crate) fn ticket_now(verification_time: Option<&Time>) -> Option<u64> {
-    verification_time
-        .cloned()
-        .or_else(super::system_now)
-        .and_then(|t| t.to_unix_checked())
+    ticket_clock(verification_time).map(|(now, _live)| now)
+}
+
+/// [`ticket_now`] plus whether that reading comes from a *live* clock:
+/// `true` for the system clock, `false` for a configured verification
+/// time.
+///
+/// A configured time is a constant for the lifetime of the (immutable)
+/// config, so it bounds nothing that relies on time passing: against it
+/// the RFC 8446 §8.2 expected ticket age never grows, and a captured
+/// ClientHello whose reported age was in tolerance once stays in tolerance
+/// forever. Ticket *expiry* against such a clock is merely frozen (the
+/// embedder's documented trade-off); 0-RTT freshness would be an
+/// anti-replay defence that does not exist, so it is not counted (see
+/// [`try_accept_psk13`]). Mirrors the TLS 1.3 server's `ticket_clock`.
+pub(crate) fn ticket_clock(verification_time: Option<&Time>) -> Option<(u64, bool)> {
+    let (time, live) = match verification_time {
+        Some(pinned) => (pinned.clone(), false),
+        None => (super::system_now()?, true),
+    };
+    time.to_unix_checked()
         .filter(|t| *t != 0)
+        .map(|now| (now, live))
 }
 
 /// Whether a client leaf recorded in a ticket may still stand in for client
@@ -236,7 +258,10 @@ pub(crate) struct AcceptedPsk13 {
     pub(crate) alpn: Vec<u8>,
     /// RFC 8446 §8.2: the client's reported ticket age agrees with the
     /// server's expected age within [`MAX_TICKET_AGE_DEVIATION_MS`]. `false`
-    /// refuses 0-RTT only.
+    /// refuses 0-RTT only. Always `false` when the ticket clock is not
+    /// live (a pinned verification time, see [`ticket_clock`]): agreement
+    /// with a clock that never advances says nothing about how old the
+    /// flight is.
     pub(crate) age_fresh: bool,
     /// The cipher suite the issuing handshake used; 0-RTT is refused unless
     /// this handshake negotiates the very same suite (the early-data keys
@@ -266,8 +291,12 @@ pub(crate) struct AcceptedPsk13 {
 pub(crate) struct PskAcceptContext<'a> {
     /// The effective sealing key (see [`seal_key`]).
     pub(crate) seal_key: &'a [u8; 32],
-    /// Unix time now (see [`ticket_now`]).
+    /// Unix time now (see [`ticket_clock`]).
     pub(crate) now: u64,
+    /// Whether `now` is a live clock reading rather than a pinned
+    /// verification time (see [`ticket_clock`]). Only a live clock makes
+    /// the RFC 8446 §8.2 ticket-age check a replay bound.
+    pub(crate) clock_live: bool,
     /// The configured ticket lifetime, seconds (0 disables the expiry check).
     pub(crate) ticket_lifetime: u32,
     /// The peer's transport address, as the cookie generator sees it.
@@ -397,7 +426,15 @@ pub(crate) fn try_accept_psk13(
         // RFC 8446 §8.2: ticket-age freshness, de-obfuscated with the
         // ticket's own `age_add`. A stale or forward-dated report marks the
         // PSK as unfit for 0-RTT; resumption itself is unaffected.
-        let age_fresh = {
+        //
+        // The check is only a replay bound against a clock that advances.
+        // Under a pinned verification time the expected age is a constant,
+        // so a captured flight that matched once would match forever (and
+        // the `ReplayWindow`, which forgets a binder once freshness is
+        // supposed to have taken over, would re-admit it every retention
+        // period). Such a clock therefore never yields a fresh ticket:
+        // 0-RTT is refused, 1-RTT resumption proceeds.
+        let age_fresh = ctx.clock_live && {
             let client_age_ms = obfuscated_age.wrapping_sub(age_add) as u64;
             let expected_age_ms = ctx.now.saturating_sub(creation_secs).saturating_mul(1000);
             client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS

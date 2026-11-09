@@ -102,7 +102,7 @@ use super::record13::{
 };
 use super::reliability13::{ACK_DELAY, InFlightRecord, Retransmit13};
 use super::ticket::{
-    AcceptedPsk13, PskAcceptContext, TICKET_DTLS13_AAD, seal_key, ticket_now, try_accept_psk13,
+    AcceptedPsk13, PskAcceptContext, TICKET_DTLS13_AAD, seal_key, ticket_clock, try_accept_psk13,
 };
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
@@ -213,10 +213,21 @@ pub(crate) struct ServerConfig13Internal {
     /// Largest 0-RTT payload accepted on a resumed connection, in bytes
     /// (RFC 8446 §4.2.10). `0` (the default) refuses early data. Forwarded
     /// from [`crate::tls::Config::max_early_data`].
+    ///
+    /// 0-RTT needs a clock that advances — the system clock (`std`) — for
+    /// the RFC 8446 §8.2 ticket-age freshness check to bound replay. Under
+    /// a pinned [`Self::verification_time`] (the only clock a `no_std`
+    /// server has) the expected ticket age never changes, so the server
+    /// fails closed: it does not advertise early data in its tickets and
+    /// refuses any 0-RTT flight, falling back to the 1-RTT handshake.
+    /// Resumption itself is unaffected.
     pub max_early_data_size: u32,
     /// Shared anti-replay set for 0-RTT binders (RFC 8446 §8), forwarded
     /// from [`crate::tls::Config::replay_window`]. Without one, early data
-    /// is only defended by the ticket-age freshness window (§8.2).
+    /// is only defended by the ticket-age freshness window (§8.2). It does
+    /// not replace that window: it only remembers a binder for the
+    /// freshness horizon, so it does not enable 0-RTT under a pinned
+    /// [`Self::verification_time`] either.
     #[cfg(feature = "std")]
     pub replay_window: Option<crate::tls::conn::ReplayWindow>,
 }
@@ -697,8 +708,27 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     /// The clock used for session tickets (see `ticket::ticket_now`).
+    /// Callers that rely on time *passing* — the 0-RTT anti-replay logic —
+    /// use [`Self::ticket_clock`].
     fn ticket_now(&self) -> Option<u64> {
-        ticket_now(self.config.verification_time.as_ref())
+        self.ticket_clock().map(|(now, _live)| now)
+    }
+
+    /// [`Self::ticket_now`] plus whether the reading is live (the system
+    /// clock) rather than a pinned `verification_time` (see
+    /// `ticket::ticket_clock`).
+    fn ticket_clock(&self) -> Option<(u64, bool)> {
+        ticket_clock(self.config.verification_time.as_ref())
+    }
+
+    /// Whether 0-RTT can be accepted at all: a budget is configured and
+    /// the ticket clock is live. Under a pinned `verification_time` the
+    /// RFC 8446 §8.2 freshness check is a constant and bounds no replay,
+    /// so early data is refused. Also gates the `early_data` advertisement
+    /// in NewSessionTicket, so clients are not invited to send a flight
+    /// this server will always refuse.
+    fn early_data_available(&self) -> bool {
+        self.config.max_early_data_size > 0 && self.ticket_clock().is_some_and(|(_, live)| live)
     }
 
     /// The effective ticket-sealing key (see `ticket::seal_key`); `None`
@@ -740,12 +770,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         transcript_prefix: &[u8],
         suite_hash: HashAlg,
     ) -> Result<Option<AcceptedPsk13>, Error> {
-        let (Some(seal), Some(now)) = (self.ticket_seal_key(), self.ticket_now()) else {
+        let (Some(seal), Some((now, clock_live))) = (self.ticket_seal_key(), self.ticket_clock())
+        else {
             return Ok(None);
         };
         let ctx = PskAcceptContext {
             seal_key: &seal,
             now,
+            clock_live,
             ticket_lifetime: self.config.ticket_lifetime,
             peer_addr: &self.peer_addr,
             // A listener that requires a client certificate resumes only
@@ -2412,7 +2444,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         // 0-RTT: accept only when a PSK was taken, the client offered early
         // data, no HRR intervened (RFC 8446 §4.2.10), our policy is
-        // non-zero, the ticket is age-fresh (§8.2) and from this address
+        // non-zero and the ticket clock is live (`early_data_available`),
+        // the ticket is age-fresh (§8.2) and from this address
         // (RFC 9147 §5.1 — the same condition that let us skip the cookie),
         // and the negotiated suite is exactly the ticket's (the early keys
         // are derived under it, §4.6.1).
@@ -2420,7 +2453,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.early_data_offered = client_offered_early;
         let mut accept_early = client_offered_early
             && plan_was_fresh
-            && self.config.max_early_data_size > 0
+            && self.early_data_available()
             && psk_state
                 .as_ref()
                 .is_some_and(|s| s.age_fresh && s.same_address && s.suite == Some(suite.suite));
@@ -2437,11 +2470,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             accept_early = false;
         }
         // Anti-replay floor: never accept undefended 0-RTT. The §8.2
-        // freshness window is real here (a clock is required to accept a
-        // ticket at all), so it always provides a bound; a `ReplayWindow`
-        // tightens it. (This mirrors the TLS 1.3 server, where the freshness
-        // check can be skipped on a clock-less build; the DTLS servers never
-        // reach this without a clock.)
+        // freshness window is only a bound against a clock that advances:
+        // `accept_early` required a live ticket clock above
+        // (`early_data_available`, and `age_fresh` is never set under a
+        // pinned `verification_time`), so a captured flight stops being
+        // acceptable once the window has passed; a `ReplayWindow` tightens
+        // it within the window but is no substitute for it (it forgets a
+        // binder after the freshness horizon). Mirrors the TLS 1.3 server.
         if accept_early {
             let ticket_alpn = psk_state.as_ref().expect("psk_state set").alpn.as_slice();
             if ticket_alpn != alpn_pick.as_deref().unwrap_or(&[]) {
@@ -3056,7 +3091,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         drop(plain);
 
         let mut extensions = Vec::new();
-        if self.config.max_early_data_size > 0 {
+        // Only advertise 0-RTT when it can actually be accepted (not under
+        // a pinned `verification_time`).
+        if self.early_data_available() {
             extensions.push(ext::early_data_with_size(self.config.max_early_data_size));
         }
         let nst = NewSessionTicket {

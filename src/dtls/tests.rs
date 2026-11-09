@@ -2484,6 +2484,17 @@ mod dtls13 {
         (cfg, cert)
     }
 
+    /// [`make_ticket_server13`] on the system clock. 0-RTT needs it: the
+    /// RFC 8446 §8.2 ticket-age check bounds replay only against a clock
+    /// that advances, so a pinned verification time never accepts early
+    /// data.
+    #[cfg(feature = "std")]
+    fn make_live_ticket_server13(cookie: bool, max_early: u32) -> (PcServerConfig13, Vec<u8>) {
+        let (mut cfg, cert) = make_ticket_server13(cookie, max_early);
+        cfg.verification_time = None;
+        (cfg, cert)
+    }
+
     /// A first DTLS 1.3 handshake, driven to completion and one extra round
     /// so the server's NewSessionTicket (a post-handshake flight) reaches
     /// the client; returns the stored session.
@@ -2744,16 +2755,19 @@ mod dtls13 {
     /// exchange skipped for a same-address resumption (RFC 9147 §5.1), the
     /// client streams early data in epoch-1 records and the server accepts
     /// it. `EndOfEarlyData` is never sent (§5.6): the epoch change ends it.
+    /// The server runs on the system clock (see
+    /// `zero_rtt_refused_under_pinned_verification_time`).
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_round_trip() {
-        let (server_cfg, cert) = make_ticket_server13(true, 4096);
+        let (server_cfg, cert) = make_live_ticket_server13(true, 4096);
         let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-0rtt-c1");
         assert!(
             matches!(session.max_early_data_size, Some(n) if n > 0),
             "the ticket advertised early data"
         );
 
-        let (server_cfg, _) = make_ticket_server13(true, 4096);
+        let (server_cfg, _) = make_live_ticket_server13(true, 4096);
         let mut roots = RootCertStore::new();
         roots.add_der(cert.clone()).unwrap();
         let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
@@ -2775,13 +2789,123 @@ mod dtls13 {
         assert_eq!(server.take_early_data(), b"early data over dtls");
     }
 
+    /// A pinned `verification_time` is a clock that never advances, so the
+    /// RFC 8446 §8.2 ticket-age check against it cannot bound replay: a
+    /// captured 0-RTT flight would stay "fresh" forever. Such a server must
+    /// refuse early data (with or without a `ReplayWindow`, whose entries
+    /// only outlive the freshness horizon), must not advertise it in its
+    /// own tickets, and must still resume over 1-RTT. The live-clock
+    /// acceptance path is `zero_rtt_round_trip`. Mirrors the TLS 1.3 test
+    /// of the same name.
+    #[cfg(feature = "std")]
+    #[test]
+    fn zero_rtt_refused_under_pinned_verification_time() {
+        // The pinned time is the real "now", so a ticket the live-clock
+        // server issues a moment earlier is in its lifetime *and* inside
+        // the ±10 s age tolerance: before the fix this flight was accepted.
+        let pinned_now = || {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            Time::from_unix(secs)
+        };
+        let client_cfg = |cert: &[u8], session| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert.to_vec()).unwrap();
+            let mut cfg = PcClientConfig13::new(roots, "dtls.example")
+                .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+            cfg.session = session;
+            cfg
+        };
+
+        for with_window in [false, true] {
+            // A live-clock server hands out a ticket advertising 0-RTT.
+            let (live, cert) = make_live_ticket_server13(true, 4096);
+            let session = first_handshake_for_session(live, &cert, b"dtls13-pinned-c1");
+            assert_eq!(session.max_early_data_size, Some(4096));
+
+            // The same ticket + early data against a pinned-clock server.
+            let (mut pinned, _) = make_live_ticket_server13(true, 4096);
+            pinned = pinned.with_verification_time(pinned_now());
+            if with_window {
+                pinned = pinned.with_replay_window(crate::tls::conn::ReplayWindow::new());
+            }
+            let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-pinned-c2", b"nonce", &[]);
+            let mut client = DtlsClientConnection13::new(
+                client_cfg(&cert, Some(session)),
+                b"client-addr".to_vec(),
+                &mut crng,
+            );
+            assert!(client.early_data_offered());
+            client.write_early_data(b"replayable").unwrap();
+            let srng = HmacDrbg::<Sha256>::new(b"dtls13-pinned-s2", b"nonce", &[]);
+            let mut server =
+                DtlsServerConnection13::new(Arc::new(pinned), b"client-addr".to_vec(), srng);
+            assert!(pump_handshake_13(&mut client, &mut server));
+            assert!(
+                !server.early_data_accepted(),
+                "pinned clock must refuse 0-RTT (replay window: {with_window})"
+            );
+            assert!(!client.early_data_accepted());
+            assert!(server.take_early_data().is_empty());
+            // ... but the handshake is a 1-RTT *resumption*, not a full one.
+            assert!(server.psk_used(), "resumption must survive a pinned clock");
+            assert!(client.psk_accepted());
+            client.send(b"one-rtt").unwrap();
+            for dg in client.pop_outbound_datagrams() {
+                server.feed_datagram(&dg).unwrap();
+            }
+            assert_eq!(server.take_received(), b"one-rtt");
+            assert!(server.take_early_data().is_empty());
+
+            // The pinned server's own ticket does not invite early data,
+            // and resumes.
+            let mut session = client.take_session();
+            for _ in 0..4 {
+                if session.is_some() {
+                    break;
+                }
+                for dg in server.pop_outbound_datagrams() {
+                    client.feed_datagram(&dg).unwrap();
+                }
+                for dg in client.pop_outbound_datagrams() {
+                    server.feed_datagram(&dg).unwrap();
+                }
+                session = client.take_session();
+            }
+            let session = session.expect("ticket from pinned server");
+            assert!(
+                !matches!(session.max_early_data_size, Some(n) if n > 0),
+                "a server that never accepts 0-RTT must not advertise it"
+            );
+            let (mut pinned, _) = make_live_ticket_server13(true, 4096);
+            pinned = pinned.with_verification_time(pinned_now());
+            let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-pinned-c3", b"nonce", &[]);
+            let mut client = DtlsClientConnection13::new(
+                client_cfg(&cert, Some(session)),
+                b"client-addr".to_vec(),
+                &mut crng,
+            );
+            assert!(!client.early_data_offered());
+            let srng = HmacDrbg::<Sha256>::new(b"dtls13-pinned-s3", b"nonce", &[]);
+            let mut server =
+                DtlsServerConnection13::new(Arc::new(pinned), b"client-addr".to_vec(), srng);
+            assert!(pump_handshake_13(&mut client, &mut server));
+            assert!(server.psk_used() && client.psk_accepted());
+            assert!(!server.early_data_accepted());
+        }
+    }
+
     /// A resumption that goes through a HelloRetryRequest (a group change)
     /// still resumes but MUST reject 0-RTT (RFC 8446 §4.2.10): the early
     /// data is skipped and the client resends it after the handshake.
+    /// (Live-clock servers: a pinned one refuses 0-RTT regardless.)
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_rejected_after_hrr() {
         use crate::tls::codec::NamedGroup;
-        let (server_cfg, cert) = make_ticket_server13(true, 4096);
+        let (server_cfg, cert) = make_live_ticket_server13(true, 4096);
         let session = first_handshake_for_session(server_cfg, &cert, b"dtls13-0rtthrr-c1");
 
         // Server prefers X25519MLKEM768; the client shares only P-256, so
@@ -2790,8 +2914,7 @@ mod dtls13 {
         server_cfg = server_cfg
             .with_cookie_secret([0xa5; 32])
             .with_ticket_key([0x5a; 32])
-            .with_max_early_data(4096)
-            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+            .with_max_early_data(4096);
         let mut roots = RootCertStore::new();
         roots.add_der(cert.clone()).unwrap();
         let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
