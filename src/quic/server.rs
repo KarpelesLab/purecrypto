@@ -452,6 +452,10 @@ impl QuicServer {
 
     /// Sets the coarse wall-clock seconds source used for Retry-token minting
     /// (see [`QuicConnection::set_now_secs`]), propagated to every connection.
+    ///
+    /// Until this has been called with a nonzero value,
+    /// [`QuicConfig::require_retry`] is not enforced: connections are
+    /// accepted on their first Initial, without a Retry.
     pub fn set_now_secs(&mut self, secs: u64) {
         self.now_secs = secs;
         for h in self.conns.values_mut() {

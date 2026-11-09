@@ -205,14 +205,20 @@ pub struct QuicConfig {
     /// client's first Initial with a Retry packet, forcing the client to
     /// echo a server-minted token (RFC 9000 §8.1.2). Defaults to `false`.
     ///
-    /// **Requires a clock.** Retry tokens are time-bounded (5-minute
+    /// **Requires a clock.** Retry tokens are time-bounded (30-second
     /// lifetime) and the engine has no implicit time source: the server
-    /// MUST call [`QuicConnection::set_now_secs`] with a nonzero,
-    /// monotonically non-decreasing seconds value before feeding
-    /// datagrams (and keep it updated). While the clock is unset
-    /// (`now_secs == 0`), the engine fails closed: no Retry is emitted,
-    /// no token is minted or accepted, and address validation falls back
-    /// to the RFC 9000 §8.1 3× anti-amplification limit.
+    /// MUST call [`QuicConnection::set_now_secs`] (or
+    /// [`QuicServer::set_now_secs`](crate::quic::QuicServer::set_now_secs))
+    /// with a nonzero, monotonically non-decreasing seconds value before
+    /// feeding datagrams, and keep it updated.
+    ///
+    /// **Without a clock this setting is not enforced.** While the clock
+    /// is unset (`now_secs == 0`) no Retry is emitted and no token is
+    /// minted or accepted — a token that could never expire is refused —
+    /// but the first Initial is then *processed as if `require_retry` were
+    /// `false`*: the Retry requirement fails open, and address validation
+    /// falls back to the RFC 9000 §8.1 3× anti-amplification limit. A
+    /// deployment that relies on Retry must make sure the clock is set.
     ///
     /// Ignored on the client side.
     pub require_retry: bool,
@@ -849,8 +855,9 @@ pub struct QuicConnection {
     cid_remote: Option<CidPool>,
     /// Monotonic seconds counter used for retry-token timestamping, set by
     /// the caller via [`Self::set_now_secs`]. `0` means "no clock
-    /// configured" and disables the stateless-Retry path fail-closed (no
-    /// token is minted or accepted — see `maybe_emit_retry`). Server-only.
+    /// configured" and disables the stateless-Retry path: no token is
+    /// minted or accepted, and `require_retry` is not enforced (see
+    /// `maybe_emit_retry`). Server-only.
     now_secs: u64,
     /// Server-side — `true` once `cid_local` has issued its post-handshake
     /// fresh CIDs via NEW_CONNECTION_ID. Suppresses re-issuing on every
@@ -1603,11 +1610,13 @@ impl QuicConnection {
     /// is enforced against real elapsed time.
     ///
     /// The default value 0 means "no clock configured" and disables the
-    /// stateless-Retry path fail-closed: with `now_secs == 0` the server
-    /// neither emits Retry packets nor accepts retry tokens (a token
-    /// validated against a never-advancing clock would otherwise stay
-    /// valid forever). [`QuicConfig::require_retry`] therefore only takes
-    /// effect once a nonzero value has been supplied here.
+    /// stateless-Retry path: with `now_secs == 0` the server neither emits
+    /// Retry packets nor accepts retry tokens (a token validated against a
+    /// never-advancing clock would otherwise stay valid forever). Token
+    /// handling fails closed, but the Retry *requirement* fails open:
+    /// [`QuicConfig::require_retry`] only takes effect once a nonzero
+    /// value has been supplied here, and until then Initials are accepted
+    /// without a Retry.
     pub fn set_now_secs(&mut self, secs: u64) {
         self.now_secs = secs;
     }
@@ -1949,7 +1958,7 @@ impl QuicConnection {
             None => return Ok(None),
         };
 
-        // Fail-closed clock requirement: `now_secs == 0` means the caller
+        // Clock requirement: `now_secs == 0` means the caller
         // never configured a time source ([`Self::set_now_secs`]), so retry
         // tokens cannot be time-bounded — a token minted at ts = 0 and
         // validated against a forever-0 clock would never expire. Checking
@@ -1959,7 +1968,10 @@ impl QuicConnection {
         // legitimate client in an endless Retry loop. Without a clock,
         // Retry-based address validation is unavailable: the Initial is
         // processed normally and the RFC 9000 §8.1 3× anti-amplification
-        // cap remains the address-validation backstop.
+        // cap remains the address-validation backstop. Note what that
+        // means for `require_retry`: token handling fails closed (none is
+        // minted or accepted), but the requirement itself fails OPEN — a
+        // clock-less server accepts Initials without a Retry.
         if self.now_secs == 0 {
             return Ok(None);
         }
@@ -12933,14 +12945,16 @@ mod tests {
         assert!(!s.is_handshake_complete());
     }
 
-    /// Fail-closed clock requirement: a server configured with
+    /// Clock requirement: a server configured with
     /// `require_retry` but whose clock was never set (`set_now_secs` not
     /// called, so `now_secs == 0`) must NOT emit a Retry — tokens minted
     /// without a clock could never expire, and `retry::validate` rejects
     /// `now_secs == 0`, so any minted token would livelock the client in
     /// an endless Retry loop. Instead the Retry path is unavailable: no
     /// Retry packet, no token, and the handshake still completes under
-    /// the 3× anti-amplification cap.
+    /// the 3× anti-amplification cap — i.e. `require_retry` is not
+    /// enforced without a clock (it fails open, as documented on the
+    /// config field).
     #[test]
     fn retry_disabled_when_clock_unset() {
         let secret = [0x55u8; 32];
@@ -15368,7 +15382,7 @@ mod tests {
             9000,
         ));
         // Retry requires a configured clock (now_secs != 0) — without it
-        // the server fails closed and never emits a Retry at all.
+        // the server never emits a Retry at all.
         server.set_now_secs(1_000);
 
         // Build a minimal client Initial (no token). We just need a long

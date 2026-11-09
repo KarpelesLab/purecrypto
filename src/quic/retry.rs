@@ -50,7 +50,7 @@
 //! to. (A NEW_TOKEN token, which a client stores for a *future* connection,
 //! would need a longer life; this engine issues none.)
 //!
-//! ## Clock requirement (fail-closed)
+//! ## Clock requirement
 //!
 //! `now_secs == 0` is the engine's "no clock configured" sentinel (the
 //! connection's counter defaults to 0 until
@@ -64,6 +64,10 @@
 //! With the clock unset, Retry-based address validation is simply
 //! unavailable and the server falls back to the RFC 9000 §8.1 3×
 //! anti-amplification limit.
+//!
+//! Token *validation* thus fails closed, but the Retry *policy* does not:
+//! a server with `require_retry` set and no clock accepts Initials without
+//! a Retry, exactly as if the option were off.
 //!
 //! ## Replay within the token lifetime
 //!
