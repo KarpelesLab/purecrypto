@@ -814,3 +814,80 @@ fn client_commits_the_renegotiated_session_at_the_server_finished() {
         }
     }
 }
+
+/// A renegotiation that fails closes the engine for good: application data
+/// arriving afterwards under the (still installed) old keys is refused, not
+/// delivered — in both roles, and whether the failure came from the
+/// handshake, a fatal alert or `abort`.
+#[test]
+fn failed_renegotiation_stops_delivering_application_data() {
+    // Server: the renegotiating ClientHello carries a corrupted binding.
+    let (mut client, mut server) = connected_pair();
+    client.test_corrupt_renegotiation_binding();
+    client.renegotiate().unwrap();
+    server.read_tls(&client.write_tls());
+    assert_eq!(server.process_new_packets(), Err(Error::HandshakeFailure));
+    assert!(!server.is_renegotiating());
+    assert_eq!(
+        server.send_application_data(b"x"),
+        Err(Error::InappropriateState)
+    );
+    client
+        .test_emit_encrypted(ContentType::ApplicationData, b"after the failure")
+        .unwrap();
+    server.read_tls(&client.write_tls());
+    assert_eq!(server.process_new_packets(), Err(Error::UnexpectedMessage));
+    assert!(server.take_received_plaintext().is_empty());
+
+    // Client: the ServerHello's echo does not match.
+    let (mut client, mut server) = connected_pair();
+    server.test_corrupt_renegotiation_binding();
+    client.renegotiate().unwrap();
+    client.send_application_data(b"queued, never sent").unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    client.read_tls(&server.write_tls());
+    assert_eq!(client.process_new_packets(), Err(Error::HandshakeFailure));
+    assert!(!client.is_renegotiating());
+    server
+        .test_emit_encrypted(ContentType::ApplicationData, b"after the failure")
+        .unwrap();
+    client.read_tls(&server.write_tls());
+    assert_eq!(client.process_new_packets(), Err(Error::UnexpectedMessage));
+    assert!(client.take_received_plaintext().is_empty());
+
+    // A fatal alert mid-renegotiation, and `abort`, close the same way.
+    let (mut client, mut server) = connected_pair();
+    client.renegotiate().unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    assert!(server.is_renegotiating());
+    let _ = server.write_tls();
+    client
+        .test_emit_encrypted(ContentType::Alert, &[2, 40])
+        .unwrap();
+    client
+        .test_emit_encrypted(ContentType::ApplicationData, b"after the alert")
+        .unwrap();
+    server.read_tls(&client.write_tls());
+    assert_eq!(
+        server.process_new_packets(),
+        Err(Error::AlertReceived(
+            crate::tls::AlertDescription::HandshakeFailure
+        ))
+    );
+    assert_eq!(server.process_new_packets(), Err(Error::UnexpectedMessage));
+    assert!(server.take_received_plaintext().is_empty());
+
+    let (mut client, mut server) = connected_pair();
+    client.renegotiate().unwrap();
+    let _ = client.write_tls();
+    client.abort(crate::tls::AlertDescription::InternalError);
+    assert!(!client.is_renegotiating());
+    server
+        .test_emit_encrypted(ContentType::ApplicationData, b"after the abort")
+        .unwrap();
+    client.read_tls(&server.write_tls());
+    assert_eq!(client.process_new_packets(), Err(Error::UnexpectedMessage));
+    assert!(client.take_received_plaintext().is_empty());
+}

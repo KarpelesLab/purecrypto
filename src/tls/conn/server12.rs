@@ -1212,9 +1212,16 @@ impl<R: RngCore> ServerConnection12<R> {
     /// flight dies with the connection: its unproven session state is
     /// discarded (the new master secret wiped) and the session it was
     /// replacing — the last one the peer actually authenticated — is what
-    /// the accessors keep describing.
+    /// the accessors keep describing. The renegotiation bookkeeping is
+    /// cleared with it, so a closed engine never looks like one that is
+    /// still renegotiating (and still reading application data): what the
+    /// caller queued for after the renegotiation is dropped unsent.
     fn close(&mut self) {
         self.state = State::Closed;
+        self.reneg.active = false;
+        self.reneg.prev_peer_leaf = None;
+        self.reneg.pending_app_out = Vec::new();
+        self.reneg.close_pending = false;
         if let Some(mut prev) = self.replaced.take() {
             if let Some(m) = self.master.as_mut() {
                 super::wipe(m);
@@ -1662,8 +1669,15 @@ impl<R: RngCore> ServerConnection12<R> {
     /// Whether application data may be delivered now: once connected, and
     /// during a renegotiation until the client's ChangeCipherSpec switches
     /// the read side to keys whose handshake is not yet authenticated.
+    /// Never on a closed engine — a renegotiation that failed (or was cut
+    /// short by an alert or [`Self::abort`]) does not leave the read side
+    /// open.
     fn app_data_readable(&self) -> bool {
-        self.state == State::Connected || (self.reneg.active && !self.ccs_received)
+        match self.state {
+            State::Connected => true,
+            State::Closed => false,
+            _ => self.reneg.active && !self.ccs_received,
+        }
     }
 
     /// Whether the current session can be renegotiated: an established
