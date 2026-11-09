@@ -73,7 +73,35 @@ cargo +nightly fuzz run x509_certificate fuzz/artifacts/x509_certificate/crash-X
   key and Golomb-Rice `s2` decoders via `falcon_verify`, and SLH-DSA's
   fixed-layout verifier via `slhdsa_verify`.
 - **Pure crypto primitives** (cipher cores, hash cores, bignum ops) —
-  handle any input by design.
+  handle any input by design. The exceptions are the places where a
+  primitive *parses*: `hasher_from_state` covers the exported hasher-state
+  importers, `pairing_points` the BLS12-381 / BN254 / BLS12-377 point, GT,
+  scalar and BLS key / signature decoders, and `ec_explicit_params` the
+  validation of attacker-chosen curve parameters (`ec-custom`).
+
+## Targets that drive more than a parser
+
+Most targets hand the input to one decoder. Three do more, and their
+module docs describe the input layout:
+
+- `tls12_reneg_feed` completes a real TLS 1.2 handshake between two
+  in-process connections on every iteration, derives the record keys from
+  the `KeyLog` sink, and then interprets the input as a script: start a
+  renegotiation, send data, forward / rewrite / inject / drop records. It
+  is the only target that reaches the RFC 5746 state machine. It runs a
+  few hundred iterations per second, not tens of thousands.
+- `hasher_from_state` and `ec_explicit_params` can start from a genuine
+  value built in the harness (an exported state, a pinned explicit curve)
+  and apply fuzz-chosen patches to it, so the later validation stages are
+  reachable without a seed corpus.
+
+## Feature coverage
+
+`fuzz/Cargo.toml` enables every opt-in feature that adds `#[cfg]` arms to
+a parser a target already drives (`legacy-ec`, `ec-custom`,
+`legacy-ciphers`, `dsa`, `legacy-hashes`, …). When a new feature gates
+code inside an existing parser, add it there: otherwise the target keeps
+building and silently skips the new arms.
 
 ## Triage convention
 

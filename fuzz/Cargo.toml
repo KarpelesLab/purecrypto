@@ -37,6 +37,13 @@ purecrypto = { path = "..", features = [
     "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
     "mlkem", "mldsa", "slhdsa", "hpke", "ech", "cert-compression",
     "lms", "xmss", "tls-legacy", "pkcs12", "falcon", "jose",
+    # Opt-in surfaces whose `#[cfg]` arms sit inside parsers the targets
+    # already drive: binary curves in the X.509 key / signature paths
+    # (`legacy-ec`), explicit EC parameters (`ec-custom`), the PKCS#12
+    # RC2 PBEs (`legacy-ciphers`), DSA keys, the extra exportable digests
+    # (`legacy-hashes`), and the pairing-curve point decoders.
+    "legacy-ec", "ec-custom", "legacy-ciphers", "dsa", "legacy-hashes",
+    "bls", "bn254", "bls12-377",
     # Internal: exposes the crate-private TLS decoders to
     # `tls_handshake_messages`. Only this crate should ever enable it.
     "__fuzz",
@@ -362,6 +369,40 @@ bench = false
 [[bin]]
 name = "x509_verify_chain"
 path = "fuzz_targets/x509_verify_chain.rs"
+test = false
+doc = false
+bench = false
+
+# --- Surfaces added after the first fuzzing pass: pairing-curve point /
+# GT / scalar / BLS key and signature decoders (BLS12-381, BN254,
+# BLS12-377), the exportable hasher-state importers, explicit-parameter
+# (custom) elliptic curves, and TLS 1.2 renegotiation (RFC 5746) driven
+# past a real handshake.
+
+[[bin]]
+name = "pairing_points"
+path = "fuzz_targets/pairing_points.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hasher_from_state"
+path = "fuzz_targets/hasher_from_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_explicit_params"
+path = "fuzz_targets/ec_explicit_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls12_reneg_feed"
+path = "fuzz_targets/tls12_reneg_feed.rs"
 test = false
 doc = false
 bench = false

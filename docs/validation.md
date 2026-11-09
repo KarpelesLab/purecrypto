@@ -815,9 +815,14 @@ update with the commands in `tools/wycheproof/README.md`.
 
 ## Fuzzing
 
-40 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
+44 `cargo-fuzz` (libFuzzer) targets under `fuzz/fuzz_targets/`, run in CI
 (`.github/workflows/fuzz.yml`). They concentrate on the untrusted-input
-attack surface — parsers and protocol feeders:
+attack surface — parsers and protocol feeders. The fuzz crate builds the
+library with the opt-in parser features on (`legacy-ec`, `ec-custom`,
+`legacy-ciphers`, `dsa`, `legacy-hashes`, `bls`, `bn254`, `bls12-377`), so
+the binary-curve arms of the X.509 key and signature paths, explicit EC
+parameters and the PKCS#12 RC2 PBEs are compiled into the targets that
+reach them:
 
 - **Encoding/parsers**: `der_reader`, `pem_decode`, `spki_pubkey`,
   `pkcs8_{rsa,ed25519,mldsa,slhdsa}`, `mlkem_pkcs8`, `ecdsa_sig_der`,
@@ -842,6 +847,32 @@ attack surface — parsers and protocol feeders:
   crate-private handshake / extension decoders fed directly through the
   hidden `__fuzz` feature, which the feed targets cannot reach past the key
   exchange).
+- **TLS 1.2 renegotiation**: `tls12_reneg_feed` completes a real handshake
+  between two in-process connections, derives the record keys through the
+  public `KeyLog` sink, and then acts as a key-holding man in the middle
+  driven by the input: it starts renegotiations from either side and
+  forwards, rewrites, injects or drops first-epoch records, so the
+  RFC 5746 handling of a post-handshake ClientHello / HelloRequest and the
+  renegotiation handshake run on hostile plaintext. It also asserts that an
+  untampered direction delivers application data in order. Records of the
+  second epoch are forwarded unmodified.
+- **Pairing curves**: `pairing_points` — every `G1` / `G2` / `Gt` / `Fp` /
+  `Fr` byte decoder of `bls`, `bn254` and `bls12_377` (gnark and arkworks
+  forms), the BLS secret-key, public-key, signature and
+  proof-of-possession decoders of every variant, and BN254's EIP-197
+  input; a successful decode must re-encode to the input.
+- **Hasher state import**: `hasher_from_state` — `Hasher::from_state` for
+  every `HashAlgorithm` and `ExportableState::from_state` for SHAKE,
+  BLAKE2X and the BLAKE2 MACs, from raw bytes and from genuine exported
+  states with fuzz-chosen patches; an accepted state is then updated and
+  finalized, must re-export to itself, and an unmodified one must resume
+  to the one-shot digest.
+- **Explicit EC parameters**: `ec_explicit_params` —
+  `BoxedCurve::from_params` / `from_der` and the SEC1 / PKCS#8 private-key
+  parsers on `specifiedCurve` input (raw DER, seven free integers, and
+  valid curves with one parameter replaced), then point, scalar and
+  signature decoding, one verification and one ECDH on any curve that
+  validates.
 
 The CI run is a smoke-level budget, not a campaign: it runs weekly, for a
 few minutes per target, from the corpus the previous runs accumulated in the

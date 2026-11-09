@@ -81,6 +81,10 @@ jobs:
           - jose_jwk_parse
           - x509_sct_list
           - x509_verify_chain
+          - pairing_points
+          - hasher_from_state
+          - ec_explicit_params
+          - tls12_reneg_feed
     steps:
       - uses: actions/checkout@v7
 
