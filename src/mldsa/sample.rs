@@ -7,7 +7,6 @@
 use super::encode::{unpack_z17, unpack_z19};
 use super::field::{N, Poly, Q, sub};
 use crate::hash::{ExtendableOutput, Shake128, Shake256, XofReader};
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
 use crate::zeroize::Zeroize;
 
 /// The SHAKE128 rate — the matrix-XOF squeeze block (a multiple of 3).
@@ -135,6 +134,10 @@ pub(crate) fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
             }
         }
     }
+    // The last block still holds raw sampler output: the nibbles behind the
+    // final coefficients of a secret polynomial (s1/s2 in key generation).
+    // (The XOF reader wipes its own sponge state on drop.)
+    block.zeroize();
     a
 }
 
@@ -190,11 +193,17 @@ pub(crate) fn expand_mask(seed: &[u8], gamma1_bits: u32) -> Poly {
     if gamma1_bits == 17 {
         let mut buf = [0u8; N * 18 / 8];
         reader.read(&mut buf);
-        unpack_z17(&buf)
+        let y = unpack_z17(&buf);
+        // `buf` is the packed secret mask polynomial; like the batched
+        // `expand_mask_xn`, do not leave it on the stack.
+        buf.zeroize();
+        y
     } else {
         let mut buf = [0u8; N * 20 / 8];
         reader.read(&mut buf);
-        unpack_z19(&buf)
+        let y = unpack_z19(&buf);
+        buf.zeroize();
+        y
     }
 }
 
