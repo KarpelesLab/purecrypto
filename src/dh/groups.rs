@@ -359,11 +359,11 @@ impl DhGroup {
     /// * `q | p − 1`;
     /// * `g^q ≡ 1 (mod p)` — with `g ≠ 1` and `q` prime, `g` has order
     ///   exactly `q`;
-    /// * `q` passes trial division and
-    ///   [`CUSTOM_GROUP_MR_ROUNDS`](Self::CUSTOM_GROUP_MR_ROUNDS) Miller-Rabin
-    ///   rounds, and `p` [`custom_group_mr_rounds`] rounds — both with bases
-    ///   HMAC-DRBG-derived from the candidate, i.e. deterministic and
-    ///   *public*, with the caveat spelled out on `CUSTOM_GROUP_MR_ROUNDS`.
+    /// * `q` and `p` each pass trial division and [`custom_group_mr_rounds`]
+    ///   Miller-Rabin rounds for their own width (64 up to 3072 bits, 32
+    ///   above) — both with bases HMAC-DRBG-derived from the candidate, i.e.
+    ///   deterministic and *public*, with the caveat spelled out on
+    ///   [`CUSTOM_GROUP_MR_ROUNDS`](Self::CUSTOM_GROUP_MR_ROUNDS).
     ///   Unlike the safe-prime case `p` cannot be proved prime from `q`
     ///   (`q` is far below `√p`), so both verdicts rest on Miller-Rabin.
     ///
@@ -377,8 +377,12 @@ impl DhGroup {
     /// [`from_custom`](Self::from_custom) admits are rejected.
     ///
     /// Validation costs about `custom_group_mr_rounds(L)` full-width
-    /// exponentiations (dominated by the `p` test); validate a group once
-    /// and clone it.
+    /// exponentiations for the usual narrow `q` (the `p` test dominates),
+    /// and at most about twice that when `q` is nearly as wide as `p` (a
+    /// safe prime passed with `q = (p − 1) / 2`): `q`'s width is not capped,
+    /// but its round count follows the same schedule as `p`'s, so a wide
+    /// `q` never gets more rounds than `p` does. Validate a group once and
+    /// clone it.
     ///
     /// [`custom_group_mr_rounds`]: Self::custom_group_mr_rounds
     /// [`DhPrivateKey::shared_secret`]: super::DhPrivateKey::shared_secret
@@ -406,13 +410,18 @@ impl DhGroup {
         if group.mont.pow_public(&group.g, &q) != one {
             return Err(Error::InvalidGroup);
         }
-        // `q` first: it is narrow, so a bad one is rejected cheaply.
+        // `q` first: it is usually far narrower than `p` (160..=256 bits
+        // against 1024+), so a bad one is rejected cheaply. Nothing caps its
+        // width below `p`'s, though — `q = (p − 1) / 2` is allowed — so its
+        // round count follows the width schedule rather than being a fixed
+        // 64: a wide `q` must not cost more than the `p` test itself.
+        let (q_rounds, p_rounds) = Self::params_mr_rounds(bits, q.bit_len());
         let mut rng = HmacDrbg::<Sha256>::new(
             &q.to_be_bytes(q.bit_len().div_ceil(8)),
             b"purecrypto-dh-params-q-mr-bases",
             &[],
         );
-        if !is_prime_boxed(&q, &mut rng, Self::CUSTOM_GROUP_MR_ROUNDS) {
+        if !is_prime_boxed(&q, &mut rng, q_rounds) {
             return Err(Error::InvalidGroup);
         }
         let mut rng = HmacDrbg::<Sha256>::new(
@@ -420,11 +429,24 @@ impl DhGroup {
             b"purecrypto-dh-params-p-mr-bases",
             &[],
         );
-        if !is_prime_boxed(&group.p, &mut rng, Self::custom_group_mr_rounds(bits)) {
+        if !is_prime_boxed(&group.p, &mut rng, p_rounds) {
             return Err(Error::InvalidGroup);
         }
         group.q = Some(q);
         Ok(group)
+    }
+
+    /// The Miller-Rabin round counts `(q, p)` that
+    /// [`from_params`](Self::from_params) spends on a `q_bits`-bit `q` and a
+    /// `p_bits`-bit `p`: each follows
+    /// [`custom_group_mr_rounds`](Self::custom_group_mr_rounds) for its own
+    /// width, which bounds the validation of any accepted size at twice the
+    /// `p` test.
+    fn params_mr_rounds(p_bits: usize, q_bits: usize) -> (usize, usize) {
+        (
+            Self::custom_group_mr_rounds(q_bits),
+            Self::custom_group_mr_rounds(p_bits),
+        )
     }
 }
 
@@ -1017,6 +1039,67 @@ mod tests {
             "the floor value itself must be accepted"
         );
         assert!(DhGroup::from_custom(p, g, 256).is_ok());
+    }
+
+    /// `from_params` must not spend the full 64 rounds on a wide `q`: `q` is
+    /// only bounded above by `p` (16384 bits), and 64 rounds on
+    /// `q = (p − 1) / 2` on top of the `p` test cost three times the
+    /// `from_custom` budget for the same prime.
+    #[test]
+    fn from_params_mr_rounds_follow_each_width() {
+        // The usual narrow subgroup: unchanged, 64 rounds for `q`.
+        assert_eq!(DhGroup::params_mr_rounds(1024, 160), (64, 64));
+        assert_eq!(DhGroup::params_mr_rounds(2048, 256), (64, 64));
+        assert_eq!(DhGroup::params_mr_rounds(8192, 256), (64, 32));
+        // The schedule's boundary applies to `q` as it does to `p`.
+        assert_eq!(DhGroup::params_mr_rounds(4096, 3072), (64, 32));
+        assert_eq!(DhGroup::params_mr_rounds(4096, 3073), (32, 32));
+        // Safe primes passed as (p, 4, (p − 1) / 2), up to the widest `p`.
+        assert_eq!(DhGroup::params_mr_rounds(3072, 3071), (64, 64));
+        assert_eq!(DhGroup::params_mr_rounds(4096, 4095), (32, 32));
+        assert_eq!(DhGroup::params_mr_rounds(8192, 8191), (32, 32));
+        let max = DhGroup::MAX_CUSTOM_GROUP_BITS;
+        assert_eq!(DhGroup::params_mr_rounds(max, max - 1), (32, 32));
+        // Whatever the (valid, `q < p`) widths, `q` gets the rounds a prime
+        // of its width gets in `from_custom`, and a `q` above 3072 bits
+        // costs no more rounds than the `p` test it comes with.
+        for p_bits in [1024usize, 2048, 3072, 4096, 8192, max] {
+            for q_bits in [160usize, 256, 3072, 3073, p_bits - 1] {
+                if q_bits >= p_bits {
+                    continue;
+                }
+                let (q_rounds, p_rounds) = DhGroup::params_mr_rounds(p_bits, q_bits);
+                assert_eq!(q_rounds, DhGroup::custom_group_mr_rounds(q_bits));
+                assert_eq!(p_rounds, DhGroup::custom_group_mr_rounds(p_bits));
+                if q_bits > 3072 {
+                    assert_eq!((q_rounds, p_rounds), (32, 32));
+                }
+            }
+        }
+    }
+
+    /// The wide-`q` schedule end to end: RFC 3526 safe primes passed as
+    /// `(p, 4, (p − 1) / 2)` — the widest `q` a given `p` admits — are still
+    /// accepted with the reduced round count. Ignored by default (slow in a
+    /// debug build); run with `cargo test --release -- --ignored --nocapture`
+    /// for the timings.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "std")]
+    fn from_params_accepts_safe_primes_with_wide_q() {
+        for (name, g) in [("group16", group16()), ("group18", group18())] {
+            let q = g.p().sub(&BoxedUint::from_u64(1)).shr_bits(1);
+            assert!(q.bit_len() > 3072);
+            let start = std::time::Instant::now();
+            let group = DhGroup::from_params(g.p().clone(), BoxedUint::from_u64(4), q.clone())
+                .unwrap_or_else(|e| panic!("{name} must pass from_params: {e:?}"));
+            assert_eq!(group.q(), Some(&q));
+            std::println!(
+                "from_params({name}, {} bits, q = (p - 1) / 2): {:?}",
+                g.bit_size(),
+                start.elapsed()
+            );
+        }
     }
 
     #[test]
