@@ -823,7 +823,8 @@ pub struct QuicConnection {
     /// Server-only — the SCID chosen at construction (so the seq-0
     /// stateless-reset token in our transport parameters can be derived from
     /// it before the engine serialises them). Reused as our local CID when the
-    /// first Initial arrives, unless a Retry already fixed `retry_scid`.
+    /// first Initial arrives — with or without a Retry: the SCID of a Retry
+    /// packet (`retry_scid`) is never adopted as a connection ID.
     pending_scid: Option<ConnectionId>,
     /// Server-only — resolved RFC 9000 §10.3.1 stateless-reset key (random per
     /// connection unless the hosting [`QuicServer`] supplied a shared one).
@@ -1000,10 +1001,6 @@ pub struct QuicConnection {
     /// more specific one than [`transport_error_code`] can infer (chiefly
     /// `CRYPTO_ERROR` from the TLS engine and the stream-level codes).
     pending_error_code: Option<u64>,
-    /// The caller pinned `stateless_reset_token` in its transport
-    /// parameters, so the engine must not re-derive it when the handshake
-    /// CID turns out to be the Retry SCID (L-8).
-    reset_token_pinned: bool,
     /// Server-only — the TLS config requires a client certificate, so this
     /// connection's peer is unauthenticated until the handshake completes
     /// and no application data may be written to it in the meantime
@@ -1409,7 +1406,6 @@ impl QuicConnection {
             rx_packet_authenticated: false,
             rx_dropped_datagrams: 0,
             pending_error_code: None,
-            reset_token_pinned: false,
             require_client_auth: false,
             initial_keys_installed: false,
             server_scid: None,
@@ -1488,7 +1484,6 @@ impl QuicConnection {
         });
         let pending_scid = crate::quic::server::random_default_scid();
         let mut params = cfg.transport_params.clone();
-        let reset_token_pinned = params.stateless_reset_token.is_some();
         // RFC 9001 §4.6.1 — a server that requires a client certificate must
         // hold back 0.5-RTT application data (see `build_packet_with_pad`).
         let require_client_auth = cfg.tls.client_auth.as_ref().is_some_and(|ca| ca.required);
@@ -1569,7 +1564,6 @@ impl QuicConnection {
             rx_packet_authenticated: false,
             rx_dropped_datagrams: 0,
             pending_error_code: None,
-            reset_token_pinned,
             require_client_auth,
             initial_keys_installed: false,
             server_scid: None,
@@ -2016,9 +2010,9 @@ impl QuicConnection {
             let retry_version =
                 QuicVersion::from_wire(hdr.version).unwrap_or(self.original_version);
             // L-8: the token binds the Retry SCID, so the DCID of the retried
-            // Initial — which the server adopts as its own SCID and echoes as
-            // `retry_source_connection_id` — is a value *we* chose, not one
-            // the client (or whoever replayed the token) picked.
+            // Initial — which keys that Initial and which the server echoes
+            // as `retry_source_connection_id` — is a value *we* chose, not
+            // one the client (or whoever replayed the token) picked.
             let token = crate::quic::retry::mint(
                 secret.as_bytes(),
                 &addr_bytes,
@@ -2063,11 +2057,9 @@ impl QuicConnection {
             Ok((odcid, retry_scid, token_version)) => {
                 // L-8: the retried Initial MUST be addressed to the SCID we
                 // put in the Retry packet, which the token binds. Without the
-                // check the server took the client's DCID on trust — adopting
-                // it as its own SCID and as `retry_source_connection_id`,
-                // and deriving the Initial keys from it — so a token holder
-                // could pick the server's connection ID (and desynchronise
-                // the seq-0 stateless-reset token, which is derived from it).
+                // check the server took the client's DCID on trust — echoing
+                // it as `retry_source_connection_id` and deriving the Initial
+                // keys from it — so a token holder could pick both.
                 if hdr.dcid != retry_scid.as_slice() {
                     return Ok(Some(datagram.len()));
                 }
@@ -4185,6 +4177,22 @@ impl QuicConnection {
         self.start = at;
     }
 
+    /// Test hook: every stateless-reset token this endpoint would act on —
+    /// one per peer-issued connection ID that carries one (RFC 9000 §10.3.1).
+    #[cfg(test)]
+    pub(crate) fn peer_reset_tokens_for_test(&self) -> Vec<[u8; 16]> {
+        self.cid_remote
+            .as_ref()
+            .map(|p| p.entries.values().filter_map(|e| e.reset_token).collect())
+            .unwrap_or_default()
+    }
+
+    /// Test hook: `(the CID we write as DCID, the CID we write as SCID)`.
+    #[cfg(test)]
+    pub(crate) fn cid_pair_for_test(&self) -> (ConnectionId, ConnectionId) {
+        (self.endpoint.cids.peer, self.endpoint.cids.local)
+    }
+
     /// Test hook: retires one of our local connection IDs, as a peer's
     /// RETIRE_CONNECTION_ID frame would.
     #[cfg(test)]
@@ -4833,12 +4841,12 @@ impl QuicConnection {
         }
         if let Some(retry_scid) = self.retry_scid.as_ref() {
             self.our_params.retry_source_connection_id = Some(retry_scid.as_slice().to_vec());
-            // Per RFC 9000 §7.3, ISCID equals our SCID on the current Initial.
-            // After Retry the server's SCID is the retry_scid; before Retry
-            // it's the fresh random we picked in feed_long_header_packet.
-            self.our_params.initial_source_connection_id = Some(retry_scid.as_slice().to_vec());
-        } else if !self.endpoint.cids.local.is_empty() {
-            // No Retry — ISCID = our chosen SCID.
+        }
+        // RFC 9000 §7.3 — `initial_source_connection_id` is the SCID of the
+        // first Initial we send. That is the SCID chosen at construction in
+        // both cases; after a Retry it differs from the Retry's SCID (see
+        // `commit_first_initial`).
+        if !self.endpoint.cids.local.is_empty() {
             self.our_params.initial_source_connection_id =
                 Some(self.endpoint.cids.local.as_slice().to_vec());
         }
@@ -5045,8 +5053,8 @@ impl QuicConnection {
     ///   it's overwritten in [`Self::feed_long_header_packet`] on the
     ///   first inbound server packet (the SCID field of that packet),
     ///   and in [`Self::process_retry_packet`] when a Retry happens
-    ///   (to the Retry's SCID — which is then ALSO the post-Retry
-    ///   server's first SCID since the server keys off it).
+    ///   (to the Retry's SCID, which the server's first Initial then
+    ///   replaces: RFC 9000 §7.2 lets it choose a different SCID there).
     /// * `retry_source_connection_id` MUST be `Some(self.retry_scid)`
     ///   iff a Retry was processed, else MUST be absent.
     ///
@@ -5500,35 +5508,31 @@ impl QuicConnection {
         self.hooks
             .set_version_policy(self.versions.clone(), version);
         let peer_scid = ConnectionId::from_slice(scid).ok_or(Error::Decode)?;
-        let our_scid = if let Some(retry_scid) = self.retry_scid.as_ref() {
-            // Retry path: reuse the SCID we picked for the Retry packet. This
-            // is exactly `dcid` of the retried Initial (the token binds it);
-            // we use the stored value so the bookkeeping matches the
-            // Retry-time decision.
-            let retry_scid = *retry_scid;
-            // L-8: our seq-0 stateless-reset token is derived from the CID we
-            // actually answer to. Before a Retry that is `pending_scid`, and
-            // the token advertised at construction was derived from it — but
-            // after a Retry the handshake CID is the Retry SCID instead, so
-            // the advertised token has to be re-derived or the client would
-            // never recognise a reset for this connection (RFC 9000 §10.3.1).
-            // A caller-pinned token is left alone.
-            if !self.reset_token_pinned {
-                self.our_params.stateless_reset_token =
-                    Some(crate::quic::reset::stateless_reset_token(
-                        self.reset_key.as_bytes(),
-                        &retry_scid,
-                    ));
-            }
-            retry_scid
-        } else {
-            // No-Retry path: reuse the SCID chosen at construction (so it
-            // matches the seq-0 stateless-reset token already advertised in
-            // our transport parameters) and capture the ODCID for the
-            // transport-param echo (RFC 9000 §7.3).
+        // Our handshake SCID is the one chosen at construction, so it matches
+        // the seq-0 stateless-reset token already advertised in our transport
+        // parameters (RFC 9000 §10.3.1) — with or without a Retry.
+        //
+        // After a Retry this is deliberately NOT the Retry packet's SCID.
+        // That value travels in cleartext before any connection ID of ours is
+        // routable: a `QuicServer` only knows it as a pre-handshake key for
+        // the client's own address, so a short-header packet carrying it from
+        // anywhere else looks like a packet for an unknown connection and
+        // draws a stateless reset — whose token is derived from the CID. Were
+        // the Retry SCID to become our connection ID, an observer of the
+        // Retry could collect our seq-0 reset token that way and later end
+        // the established connection with one spoofed datagram. RFC 9000
+        // §7.2 lets the server pick a fresh SCID for its first Initial; §7.3
+        // then has `initial_source_connection_id` name that SCID while
+        // `retry_source_connection_id` names the Retry's. The client keeps
+        // addressing (and keying) its Initials by the Retry SCID until our
+        // first packet arrives, which is what `dcid` is here.
+        if self.retry_scid.is_none() {
+            // No-Retry path: capture the ODCID for the transport-parameter
+            // echo (RFC 9000 §7.3). With a Retry it was pinned when the
+            // Retry was emitted / its token validated.
             self.original_dcid = ConnectionId::from_slice(dcid);
-            self.pending_scid.unwrap_or_else(random_default_scid)
-        };
+        }
+        let our_scid = self.pending_scid.unwrap_or_else(random_default_scid);
         set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
         install_initial_keys(&mut self.endpoint, version, dcid);
         // The DCID a later compatible switch (RFC 9369 §4.1) re-keys from.
@@ -5839,7 +5843,7 @@ impl QuicConnection {
         // packet. So `hdr.dcid` is already the correct keying input
         // either way. The CID accounting differs though:
         //   * No-Retry  → our SCID is a fresh random; ODCID = hdr.dcid.
-        //   * Retry-yes → our SCID = retry_scid (set in maybe_emit_retry);
+        //   * Retry-yes → our SCID is the same fresh random, NOT retry_scid;
         //                  ODCID = original_dcid (set in maybe_emit_retry).
         //
         // M-3: none of this is committed until the packet has been
@@ -12672,11 +12676,15 @@ mod tests {
     }
 
     /// L-8 — the server's seq-0 stateless-reset token must be derived from
-    /// the connection ID it actually answers to. After a Retry that is the
-    /// Retry SCID, not the `pending_scid` picked at construction, so the
-    /// token advertised in the transport parameters had to be re-derived —
-    /// otherwise the client would never recognise a reset for this
-    /// connection (RFC 9000 §10.3.1).
+    /// the connection ID it actually answers to (RFC 9000 §10.3.1), or the
+    /// client would never recognise a reset for this connection.
+    ///
+    /// And that connection ID must NOT be the Retry packet's SCID: the Retry
+    /// exposes it in cleartext before any CID of ours is routable, so a
+    /// router can be made to hand out the reset token derived from it. After
+    /// a Retry the server therefore answers to the SCID it chose at
+    /// construction, names it in `initial_source_connection_id`, and names
+    /// the Retry SCID only in `retry_source_connection_id` (RFC 9000 §7.3).
     #[test]
     fn retry_reset_token_matches_the_handshake_cid() {
         let secret = [0x4au8; 32];
@@ -12706,10 +12714,37 @@ mod tests {
         }
         assert!(c.is_handshake_complete() && s.is_handshake_complete());
         let handshake_cid = s.endpoint.cids.local;
+        let retry_scid = s.retry_scid().expect("a Retry was sent").to_vec();
+        assert_ne!(
+            handshake_cid.as_slice(),
+            &retry_scid[..],
+            "the Retry SCID must not become the server's connection ID"
+        );
+        assert!(
+            !s.local_cids()
+                .iter()
+                .any(|c| c.as_slice() == &retry_scid[..]),
+            "nor any CID the server answers to"
+        );
+        assert_eq!(c.endpoint.cids.peer, handshake_cid);
+        // RFC 9000 §7.3 — the three authenticated CIDs, as the client saw
+        // them (it validated each against the wire before completing).
+        let peer = c.peer_transport_params().expect("server params");
         assert_eq!(
-            Some(handshake_cid.as_slice()),
-            s.retry_scid(),
-            "after a Retry the server answers to the Retry SCID"
+            peer.initial_source_connection_id.as_deref(),
+            Some(handshake_cid.as_slice())
+        );
+        assert_eq!(
+            peer.retry_source_connection_id.as_deref(),
+            Some(&retry_scid[..])
+        );
+        assert_eq!(
+            peer.original_destination_connection_id.as_deref(),
+            c.original_dcid()
+        );
+        let retry_token = crate::quic::reset::stateless_reset_token(
+            s.reset_key.as_bytes(),
+            &ConnectionId::from_slice(&retry_scid).unwrap(),
         );
         let expected =
             crate::quic::reset::stateless_reset_token(s.reset_key.as_bytes(), &handshake_cid);
@@ -12725,6 +12760,12 @@ mod tests {
             pool.entries.get(&0).and_then(|e| e.reset_token),
             Some(expected),
             "client must hold the same seq-0 reset token"
+        );
+        assert!(
+            pool.entries
+                .values()
+                .all(|e| e.reset_token != Some(retry_token)),
+            "no CID the client holds is reset by the Retry SCID's token"
         );
     }
 

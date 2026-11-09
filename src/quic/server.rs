@@ -211,11 +211,11 @@ struct Hosted {
     /// `by_cid` can drop the entries for CIDs the peer has retired instead of
     /// growing without bound (M-5).
     cids: Vec<ConnectionId>,
-    /// Pre-handshake connection IDs this connection answers to at `addr`:
-    /// the client's own first-Initial DCID and, after a Retry, the SCID it
-    /// was redirected to. Routed as `(addr, cid)` pairs, never by address
-    /// alone (M-3).
-    initial_cids: Vec<ConnectionId>,
+    /// The exact `by_initial` keys this connection owns: `addr` paired with
+    /// each pre-handshake connection ID it answers to — the client's own
+    /// first-Initial DCID and, after a Retry, the SCID it was redirected to.
+    /// Routed as `(addr, cid)` pairs, never by address alone (M-3).
+    initial_routes: Vec<(SocketAddr, ConnectionId)>,
 }
 
 /// A sans-I/O QUIC server that demultiplexes inbound UDP datagrams to per-peer
@@ -259,6 +259,12 @@ pub struct QuicServer {
     /// connection. The DCID is part of the key, so a packet only reaches a
     /// connection that has actually seen that CID.
     by_initial: HashMap<(SocketAddr, ConnectionId), u64>,
+    /// How many `by_initial` keys carry each connection ID, under any
+    /// address. A pre-handshake CID is routed only for the address that
+    /// introduced it, so the same CID from elsewhere looks like a packet for
+    /// an unknown connection — but it is not unknown, and no stateless reset
+    /// is ever issued for it (see `queue_reset`).
+    initial_cid_refs: HashMap<ConnectionId, usize>,
     /// Connection-less datagrams (resets, Version Negotiation) awaiting send.
     pending: VecDeque<(SocketAddr, EcnCodepoint, Vec<u8>)>,
     /// Connections dropped from the table after they closed, for
@@ -330,6 +336,7 @@ impl QuicServer {
             by_cid: HashMap::new(),
             by_addr: HashMap::new(),
             by_initial: HashMap::new(),
+            initial_cid_refs: HashMap::new(),
             pending: VecDeque::new(),
             recently_closed: VecDeque::new(),
             version_negotiations: 0,
@@ -613,7 +620,7 @@ impl QuicServer {
     }
 
     fn feed(&mut self, id: u64, from: SocketAddr, ecn: EcnCodepoint, datagram: &[u8]) {
-        let (initial_cids, prev_initial) = match self.conns.get_mut(&id) {
+        let (wanted, prev_routes) = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2). A *fatal*
@@ -641,9 +648,14 @@ impl QuicServer {
                 // Pre-handshake routing keys: the client's own first-Initial
                 // DCID, plus the Retry SCID when one was issued. They drop
                 // out once the handshake completes (M-3).
-                let initial_cids = h.conn.pre_handshake_cids();
-                let prev_initial = core::mem::replace(&mut h.initial_cids, initial_cids.clone());
-                (initial_cids, prev_initial)
+                let wanted: Vec<(SocketAddr, ConnectionId)> = h
+                    .conn
+                    .pre_handshake_cids()
+                    .into_iter()
+                    .map(|cid| (addr, cid))
+                    .collect();
+                let prev_routes = core::mem::replace(&mut h.initial_routes, wanted.clone());
+                (wanted, prev_routes)
             }
             None => return,
         };
@@ -656,15 +668,40 @@ impl QuicServer {
         if self.conns[&id].conn.is_address_validated() {
             self.by_addr.insert(addr, id);
         }
-        for old in prev_initial {
-            if !initial_cids.contains(&old) {
-                self.by_initial.retain(|(_, c), v| *v != id || *c != old);
+        if wanted != prev_routes {
+            for old in prev_routes {
+                if !wanted.contains(&old) {
+                    self.unroute_initial(old, id);
+                }
+            }
+            for key in wanted {
+                self.route_initial(key, id);
             }
         }
-        for cid in initial_cids {
-            self.by_initial.insert((addr, cid), id);
-        }
         self.refresh_cid_routes(id);
+    }
+
+    /// Points the pre-handshake route `key` at connection `id`, keeping
+    /// `initial_cid_refs` in step with the keys of `by_initial`.
+    fn route_initial(&mut self, key: (SocketAddr, ConnectionId), id: u64) {
+        if self.by_initial.insert(key, id).is_none() {
+            *self.initial_cid_refs.entry(key.1).or_insert(0) += 1;
+        }
+    }
+
+    /// Drops the pre-handshake route `key` if it still points at `id` (a
+    /// later connection may have taken the key over).
+    fn unroute_initial(&mut self, key: (SocketAddr, ConnectionId), id: u64) {
+        if self.by_initial.get(&key) != Some(&id) {
+            return;
+        }
+        self.by_initial.remove(&key);
+        if let Some(n) = self.initial_cid_refs.get_mut(&key.1) {
+            *n -= 1;
+            if *n == 0 {
+                self.initial_cid_refs.remove(&key.1);
+            }
+        }
     }
 
     /// Re-syncs `by_cid` with the local CIDs connection `id` currently
@@ -736,7 +773,7 @@ impl QuicServer {
                 conn,
                 addr: from,
                 cids: Vec::new(),
-                initial_cids: Vec::new(),
+                initial_routes: Vec::new(),
             },
         );
         self.feed(id, from, ecn, datagram);
@@ -749,6 +786,19 @@ impl QuicServer {
         // mistaken for a 1-RTT packet. Skip resets for packets too small to be
         // worth one.
         if triggering_len <= MIN_STATELESS_RESET_LEN {
+            return;
+        }
+        // A reset reveals the token of the CID it answers, so it is only
+        // ever sent for a CID nothing here is using. A pre-handshake CID —
+        // a client's first-Initial DCID, or the SCID of a Retry we sent — is
+        // routed for the one address that introduced it, which makes the
+        // same CID from any other address miss every routing table; it is
+        // still in use, and gets no reset. (No CID a connection answers to
+        // is ever one of these — a Retry SCID is not adopted as a connection
+        // ID, see `QuicConnection::commit_first_initial` — so this is a
+        // second line of defence: the token given out for such a CID resets
+        // nothing.)
+        if self.initial_cid_refs.contains_key(dcid) {
             return;
         }
         let token = stateless_reset_token(self.reset_key.as_bytes(), dcid);
@@ -837,10 +887,14 @@ impl QuicServer {
 
     /// Removes a hosted connection and every routing entry pointing at it.
     fn remove_conn(&mut self, id: u64) {
-        self.conns.remove(&id);
+        let Some(h) = self.conns.remove(&id) else {
+            return;
+        };
         self.by_cid.retain(|_, v| *v != id);
         self.by_addr.retain(|_, v| *v != id);
-        self.by_initial.retain(|_, v| *v != id);
+        for key in h.initial_routes {
+            self.unroute_initial(key, id);
+        }
     }
 }
 
@@ -1599,6 +1653,251 @@ mod server_tests {
                 .any(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]) == QUIC_V1),
             "VN advertises QUIC v1"
         );
+    }
+
+    const RETRY_RESET_KEY: [u8; 32] = [0x61; 32];
+
+    /// A router whose connections require a Retry (RFC 9000 §8.1.2).
+    fn retry_server() -> QuicServer {
+        let mut srv = QuicServer::with_reset_key(RETRY_RESET_KEY, || {
+            Ok(QuicConfig {
+                tls: server_identity().0,
+                transport_params: tp(),
+                require_retry: true,
+                retry_secret: Some([0x62; 32].into()),
+                ..QuicConfig::default()
+            })
+        })
+        .expect("server build");
+        srv.set_now_secs(1_000);
+        srv
+    }
+
+    /// Sends the client's first Initial and hands it the Retry that comes
+    /// back. Returns the Retry packet's Source Connection ID.
+    fn exchange_retry(
+        srv: &mut QuicServer,
+        c: &mut QuicConnection,
+        ca: SocketAddr,
+    ) -> ConnectionId {
+        let first = c.pop_datagram();
+        srv.recv(ca, EcnCodepoint::NotEct, &first).unwrap();
+        let (to, _, retry) = srv.poll_transmit().expect("a Retry");
+        assert_eq!(to, ca);
+        assert_eq!(retry[0] & 0xb0, 0xb0, "long header, type Retry");
+        assert!(srv.poll_transmit().is_none());
+        let (_, _, scid) = parse_long_invariant(&retry).expect("long header");
+        let retry_scid = ConnectionId::from_slice(scid).unwrap();
+        c.feed_datagram_from(addr(443), &retry).unwrap();
+        assert!(c.retry_used());
+        retry_scid
+    }
+
+    /// A 1-RTT-shaped datagram addressed to `dcid`.
+    fn short_header_for(dcid: &ConnectionId) -> Vec<u8> {
+        let mut pkt = alloc::vec![0x42u8];
+        pkt.extend_from_slice(dcid.as_slice());
+        pkt.extend_from_slice(&[0u8; 40]);
+        pkt
+    }
+
+    /// Every stateless-reset token `c` would act on (RFC 9000 §10.3.1).
+    fn client_reset_tokens(c: &QuicConnection) -> Vec<[u8; 16]> {
+        let tokens = c.peer_reset_tokens_for_test();
+        assert!(!tokens.is_empty(), "the client holds the seq-0 token");
+        tokens
+    }
+
+    /// The trailing 16 bytes of every queued connection-less datagram — the
+    /// token of each stateless reset the router is about to send.
+    fn queued_reset_tails(srv: &QuicServer) -> Vec<[u8; 16]> {
+        srv.pending
+            .iter()
+            .map(|(_, _, d)| d[d.len() - 16..].try_into().unwrap())
+            .collect()
+    }
+
+    /// A Retry puts its SCID on the wire in cleartext, and until the retried
+    /// Initial is processed that CID is routed only for the client's own
+    /// address. A short-header packet carrying it from anywhere else used to
+    /// miss every routing table and draw a stateless reset whose token was
+    /// `HMAC(reset_key, retry_scid)` — which, because the server adopted the
+    /// Retry SCID as its connection ID, was the seq-0 reset token of the
+    /// connection about to be established. One observed Retry and one probe
+    /// bought the ability to kill that connection later.
+    ///
+    /// The Retry SCID is no longer a connection ID at all, and no reset is
+    /// issued for a CID a pending handshake is using.
+    #[test]
+    fn retry_scid_reset_token_never_resets_the_connection() {
+        let (_, cert) = server_identity();
+        let mut srv = retry_server();
+        let mut c = client(&cert);
+        let (ca, attacker) = (addr(43100), addr(43666));
+        let retry_scid = exchange_retry(&mut srv, &mut c, ca);
+        let leaked = stateless_reset_token(&RETRY_RESET_KEY, &retry_scid);
+        let probe = short_header_for(&retry_scid);
+
+        // The race: the observer probes before the retried Initial arrives.
+        srv.recv(attacker, EcnCodepoint::NotEct, &probe).unwrap();
+        assert!(
+            srv.pending.is_empty(),
+            "no reset for a CID a pending handshake is routed by"
+        );
+
+        drive_router(&mut srv, &mut c, ca);
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        assert!(conn.is_handshake_complete() && conn.retry_used());
+        assert!(
+            !conn.local_cids().contains(&retry_scid),
+            "the Retry SCID is not a connection ID of the server"
+        );
+        // Whatever the router says about that CID from now on (it is a CID
+        // nobody uses once the handshake is done) resets nothing.
+        srv.recv(attacker, EcnCodepoint::NotEct, &probe).unwrap();
+        let held = client_reset_tokens(&c);
+        assert!(!held.contains(&leaked));
+        for tail in queued_reset_tails(&srv) {
+            assert!(
+                !held.contains(&tail),
+                "a queued reset carries a token the client would act on"
+            );
+        }
+    }
+
+    /// The same race when the half-open connection that sent the Retry is
+    /// gone before the retried Initial arrives (evicted, or reaped on the
+    /// half-open timer): nothing routes the Retry SCID any more, so the probe
+    /// does draw a reset. A new connection then accepts the token-bearing
+    /// Initial — and must not answer to the CID that reset was derived from.
+    #[test]
+    fn retry_scid_reset_after_eviction_never_resets_the_connection() {
+        let (_, cert) = server_identity();
+        let mut srv = retry_server();
+        let mut c = client(&cert);
+        let (ca, attacker) = (addr(43200), addr(43777));
+        let retry_scid = exchange_retry(&mut srv, &mut c, ca);
+        let ids: Vec<u64> = srv.conns.keys().copied().collect();
+        for id in ids {
+            srv.remove_conn(id);
+        }
+        assert!(srv.by_initial.is_empty() && srv.initial_cid_refs.is_empty());
+
+        srv.recv(
+            attacker,
+            EcnCodepoint::NotEct,
+            &short_header_for(&retry_scid),
+        )
+        .unwrap();
+        let leaked = queued_reset_tails(&srv);
+        assert_eq!(
+            leaked,
+            [stateless_reset_token(&RETRY_RESET_KEY, &retry_scid)],
+            "an unknown CID draws its derivable reset"
+        );
+        while srv.poll_transmit().is_some() {}
+
+        drive_router(&mut srv, &mut c, ca);
+        assert_eq!(srv.connection_count(), 1);
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        assert!(conn.is_handshake_complete() && conn.retry_used());
+        assert!(!conn.local_cids().contains(&retry_scid));
+        assert!(
+            !client_reset_tokens(&c).contains(&leaked[0]),
+            "the token leaked for the Retry SCID resets the new connection"
+        );
+    }
+
+    /// RFC 9000 §7.2 — after a Retry the client addresses (and keys) its
+    /// Initials by the Retry SCID until the server's first packet tells it
+    /// the server's real SCID. Both must keep working when packets are lost:
+    /// a retried Initial that never arrived, and one retransmitted because
+    /// the server's answer to it was lost.
+    #[test]
+    fn retry_handshake_survives_loss_of_the_retried_initial() {
+        let (_, cert) = server_identity();
+        let mut srv = retry_server();
+        let mut c = client(&cert);
+        let ca = addr(43300);
+        let retry_scid = exchange_retry(&mut srv, &mut c, ca);
+
+        // The retried Initial is lost on the way to the server.
+        let lost = c.pop_datagram();
+        assert_eq!(&lost[6..6 + retry_scid.len()], retry_scid.as_slice());
+        while !c.pop_datagram().is_empty() {}
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        assert!(conn.local_cids().is_empty(), "nothing committed yet");
+
+        // The client's PTO sends it again; this one arrives, but the
+        // server's whole answer is lost.
+        let deadline = c.next_timeout().expect("PTO armed");
+        c.on_timeout(deadline);
+        let again = c.pop_datagram();
+        assert_eq!(again[0] & 0xb0, 0x80, "an Initial");
+        assert_eq!(&again[6..6 + retry_scid.len()], retry_scid.as_slice());
+        srv.recv(ca, EcnCodepoint::NotEct, &again).unwrap();
+        while !c.pop_datagram().is_empty() {}
+        let mut answered = false;
+        while srv.poll_transmit().is_some() {
+            answered = true;
+        }
+        assert!(answered, "the server answers the retried Initial");
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        let local = conn.local_cids();
+        assert!(!local.is_empty() && !local.contains(&retry_scid));
+
+        // The client, having heard nothing, still addresses the Retry SCID.
+        // Its retransmission must reach the same connection.
+        let deadline = c.next_timeout().expect("PTO armed");
+        c.on_timeout(deadline);
+        let third = c.pop_datagram();
+        assert_eq!(&third[6..6 + retry_scid.len()], retry_scid.as_slice());
+        srv.recv(ca, EcnCodepoint::NotEct, &third).unwrap();
+        assert_eq!(srv.connection_count(), 1, "routed, not accepted anew");
+        assert!(srv.pending.is_empty());
+
+        // From here on nothing is lost. Fire the timers of whichever side is
+        // waiting on one until the handshake is through.
+        let sa = addr(443);
+        for _ in 0..64 {
+            let mut moved = false;
+            loop {
+                let d = c.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                moved = true;
+                srv.recv(ca, EcnCodepoint::NotEct, &d).unwrap();
+            }
+            while let Some((_, _, d)) = srv.poll_transmit() {
+                moved = true;
+                c.feed_datagram_from(sa, &d).unwrap();
+            }
+            let server_done = srv
+                .connections_mut()
+                .next()
+                .is_some_and(|(_, conn)| conn.is_handshake_complete());
+            if c.is_handshake_complete() && server_done {
+                break;
+            }
+            if !moved {
+                if let Some(t) = c.next_timeout() {
+                    c.on_timeout(t);
+                }
+                for (_, conn) in srv.connections_mut() {
+                    if let Some(t) = conn.next_timeout() {
+                        conn.on_timeout(t);
+                    }
+                }
+            }
+        }
+        assert!(c.is_handshake_complete(), "handshake completes after loss");
+        assert_eq!(srv.connection_count(), 1);
+        let (_, conn) = srv.connections_mut().next().expect("hosted");
+        assert!(conn.is_handshake_complete());
+        let server_scid = conn.cid_pair_for_test().1;
+        assert_eq!(c.cid_pair_for_test().0, server_scid);
+        assert_ne!(server_scid, retry_scid);
     }
 
     /// A short-header (1-RTT-shaped) packet for a Connection ID the server has
