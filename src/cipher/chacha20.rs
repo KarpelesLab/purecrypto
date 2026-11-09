@@ -487,6 +487,34 @@ mod simd512 {
         !crate::ct::force_portable() && crate::cpu::avx512f()
     }
 
+    /// Best-effort wipe of vectors that live in memory: volatile stores plus
+    /// a compiler fence (the contract of [`crate::zeroize::Zeroize`], which
+    /// cannot take a vendor vector type), so the stores are not elided. Used
+    /// once per kernel call, never per block.
+    ///
+    /// What it can and cannot reach: this kernel keeps the state (`init`,
+    /// whose words 4..12 are the key broadcast across lanes, and the
+    /// pre-feed-forward `v`) and a full pass's keystream in registers, so
+    /// they have no named home to scrub; what the register allocator spills
+    /// of them goes to slots of its own choosing that no source-level store
+    /// can address. Giving them a caller-owned home instead was tried and
+    /// rejected on the generated code: LLVM still copies the hot values out
+    /// to its own spill slots (so the copies outlive the wipe), and in the
+    /// ChaCha20-Poly1305 stitched loop the state is then loaded and stored
+    /// through the home on every double round. The one thing that does live
+    /// in a named array is the keystream of a partial pass, and that is
+    /// wiped. Scrubbing the spills too would take clearing the dead frame
+    /// after the kernel returns.
+    #[inline(always)]
+    fn wipe(v: &mut [__m512i; 16]) {
+        for x in v.iter_mut() {
+            // SAFETY: `x` is a live exclusive reference, and `__m512i` is
+            // plain integer data for which all-zero bytes are a valid value.
+            unsafe { core::ptr::write_volatile(x, core::mem::zeroed()) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
     #[inline(always)]
     unsafe fn qr(v: &mut [__m512i; 16], a: usize, b: usize, c: usize, d: usize) {
         unsafe {
@@ -651,7 +679,7 @@ mod simd512 {
             if rest_len > 64 {
                 // A partial pass: every whole block it covers, plus the
                 // final partial block through a scratch block.
-                let ks = keystream16(key, &n, ctr, &mut |_| {});
+                let mut ks = keystream16(key, &n, ctr, &mut |_| {});
                 let mut blocks = rest.chunks_exact_mut(64);
                 for (blk, k) in (&mut blocks).zip(ks.iter()) {
                     let q = blk.as_mut_ptr().cast::<__m512i>();
@@ -670,6 +698,11 @@ mod simd512 {
                     tmp = [0u8; 64];
                     let _ = core::hint::black_box(&tmp);
                 }
+                // Indexed by a run-time block count, so unlike a full pass's
+                // (consumed from registers) this pass's 1 KiB of raw
+                // keystream is an array in the frame, lanes past the end of
+                // the buffer included. Once per call.
+                wipe(&mut ks);
                 done = len;
                 ctr = ctr.wrapping_add(rest_len.div_ceil(64) as u32);
             }
@@ -693,6 +726,21 @@ mod simd {
 
     pub(super) fn supported() -> bool {
         !crate::ct::force_portable() && crate::cpu::avx2()
+    }
+
+    /// Best-effort wipe of vectors that live in memory (volatile stores plus
+    /// a compiler fence, so they are not elided). Once per kernel call,
+    /// never per block. See the AVX-512 kernel's `wipe` for what this can
+    /// and cannot reach; with sixteen registers this kernel spills more of
+    /// its state than that one.
+    #[inline(always)]
+    fn wipe(v: &mut [__m256i; 16]) {
+        for x in v.iter_mut() {
+            // SAFETY: `x` is a live exclusive reference, and `__m256i` is
+            // plain integer data for which all-zero bytes are a valid value.
+            unsafe { core::ptr::write_volatile(x, core::mem::zeroed()) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Rotate-left each 32-bit lane by `N` (with `M = 32 - N`).
@@ -837,7 +885,7 @@ mod simd {
             let rest_len = rest.len();
             let mut done = len - rest_len;
             if rest_len > 128 {
-                let ks = keystream8(key, n, ctr);
+                let mut ks = keystream8(key, n, ctr);
                 let mut halves = rest.chunks_exact_mut(32);
                 for (h, k) in (&mut halves).zip(ks.iter()) {
                     let q = h.as_mut_ptr().cast::<__m256i>();
@@ -855,6 +903,9 @@ mod simd {
                     tmp = [0u8; 32];
                     let _ = core::hint::black_box(&tmp);
                 }
+                // An array in the frame here (see the AVX-512 kernel): this
+                // pass's 512 bytes of raw keystream. Once per call.
+                wipe(&mut ks);
                 done = len;
                 ctr = ctr.wrapping_add(rest_len.div_ceil(64) as u32);
             }
