@@ -22,6 +22,29 @@ pub(crate) const K_LOSS_REDUCTION_FACTOR_DEN: u64 = 2;
 /// PMTU probing updates this.
 pub(crate) const K_DEFAULT_MAX_DATAGRAM_SIZE: u64 = 1200;
 
+/// Ceiling on the congestion window, in packets of `max_datagram_size`.
+///
+/// RFC 9002 puts no upper bound on `congestion_window`: every
+/// acknowledgement outside recovery grows it, and in slow start it doubles
+/// per round trip. Nothing else bounds what this endpoint keeps in flight,
+/// so a peer that acknowledges everything it is sent — whether or not it
+/// received it (the optimistic-ACK attack, RFC 9000 §21.4) — could inflate
+/// the window, and with it both the traffic it can direct and the
+/// per-packet loss-recovery state held here, without limit.
+///
+/// 10 000 packets is the ceiling quic-go applies by default (Chromium's
+/// QUIC uses 2 000); at the default 1200-byte datagram it is 12 MB in
+/// flight, i.e. about 960 Mbit/s over a 100 ms path, so it is not what
+/// limits any real transfer.
+pub(crate) const K_MAX_WINDOW_PACKETS: u64 = 10_000;
+
+/// The congestion-window ceiling for `max_datagram_size`
+/// ([`K_MAX_WINDOW_PACKETS`]).
+#[inline]
+pub(crate) const fn k_maximum_window(max_datagram_size: u64) -> u64 {
+    K_MAX_WINDOW_PACKETS.saturating_mul(max_datagram_size)
+}
+
 /// RFC 9002 §7.2 — `kMinimumWindow = 2 × max_datagram_size`.
 #[inline]
 pub(crate) const fn k_minimum_window(max_datagram_size: u64) -> u64 {
@@ -87,14 +110,21 @@ impl NewReno {
     /// `in_flight == true` packets — RFC 9002 §B.4: "ACK frames are not
     /// in flight"). For each: drops `sent_bytes` off `bytes_in_flight`;
     /// if not in recovery, grows the window (slow-start if `cwnd <
-    /// ssthresh`, else congestion-avoidance).
+    /// ssthresh`, else congestion-avoidance), never past
+    /// [`k_maximum_window`].
     pub(crate) fn on_packets_acked<'a>(&mut self, acked: impl IntoIterator<Item = &'a SentPacket>) {
+        let max = k_maximum_window(self.max_datagram_size);
         for p in acked {
             debug_assert!(p.in_flight, "caller must filter to in-flight packets");
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(p.sent_bytes as u64);
             // §B.4 / §7.5: acks for packets sent during recovery don't
             // grow the window.
             if self.in_congestion_recovery(p.time_sent) {
+                continue;
+            }
+            // At the ceiling the window stops growing; it still shrinks on
+            // congestion as usual.
+            if self.cwnd >= max {
                 continue;
             }
             if self.cwnd < self.ssthresh {
@@ -106,6 +136,7 @@ impl NewReno {
                     self.max_datagram_size.saturating_mul(p.sent_bytes as u64) / self.cwnd.max(1);
                 self.cwnd = self.cwnd.saturating_add(inc.max(1));
             }
+            self.cwnd = self.cwnd.min(max);
         }
     }
 
@@ -250,6 +281,50 @@ mod tests {
         // A new CE rise for a packet sent after the recovery window reduces again.
         c.on_ecn_ce_increase(PnSpaceId::Application, 3, Duration::from_millis(50));
         assert!(c.cwnd <= reduced, "a fresh CE event reduces again");
+    }
+
+    /// The window has a ceiling. A peer that acknowledges every packet —
+    /// truthfully or not — used to grow it without bound (slow start never
+    /// ends without a loss), and with it everything sized by what is in
+    /// flight. Growth now stops at `k_maximum_window`, in slow start and in
+    /// congestion avoidance alike, and the window still reacts to loss.
+    #[test]
+    fn congestion_window_growth_is_capped() {
+        let max = k_maximum_window(K_DEFAULT_MAX_DATAGRAM_SIZE);
+        assert_eq!(max, 12_000_000);
+        // Slow start: every acknowledged byte adds a byte.
+        let mut c = NewReno::new();
+        let mut pn = 0u64;
+        let mut ack = |c: &mut NewReno, n: u64| {
+            for _ in 0..n {
+                let p = mk(pn, Duration::from_millis(pn), 1200, true);
+                pn += 1;
+                c.on_packet_sent(1200);
+                c.on_packets_acked([&p]);
+            }
+        };
+        ack(&mut c, 9_989);
+        assert_eq!(c.cwnd, max - 1200, "uncapped growth below the ceiling");
+        ack(&mut c, 50_000);
+        assert_eq!(c.cwnd, max, "slow start stops at the ceiling");
+        assert_eq!(c.bytes_in_flight, 0);
+        // A window just under the ceiling is not pushed past it.
+        c.cwnd = max - 1;
+        ack(&mut c, 10);
+        assert_eq!(c.cwnd, max);
+        // Congestion avoidance stops there too.
+        c.ssthresh = max / 2;
+        c.cwnd = max - 3;
+        ack(&mut c, 50_000);
+        assert_eq!(c.cwnd, max, "congestion avoidance stops at the ceiling");
+        // Loss still halves it, and it can grow back.
+        let lost = mk(pn, Duration::from_secs(3600), 1200, true);
+        c.on_packet_sent(1200);
+        c.on_packets_lost([&lost], Duration::from_secs(3601));
+        assert_eq!(c.cwnd, max / 2);
+        // The ceiling follows the datagram size.
+        c.max_datagram_size = 1452;
+        assert_eq!(k_maximum_window(c.max_datagram_size), 14_520_000);
     }
 
     /// Test 8 — slow-start additive growth, then switch to congestion
