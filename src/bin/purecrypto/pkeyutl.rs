@@ -602,8 +602,9 @@ fn run_sign(args: Args) {
     // Stateful hash-based signature? Detect from the raw key bytes and route to
     // the special path that rewrites the advanced key file before emitting the
     // signature. (Reading the file twice is fine; the authoritative parse is in
-    // `stateful_sign`.)
-    if let Ok(raw) = std::fs::read(inkey)
+    // `stateful_sign`.) Whatever the key turns out to be, these are private-key
+    // bytes: hold them in `Zeroizing` like the neighbouring readers do.
+    if let Ok(raw) = std::fs::read(inkey).map(Zeroizing::new)
         && parse_stateful(&raw).is_some()
     {
         // Resolve `-out` BEFORE signing. A stateful signature consumes a
