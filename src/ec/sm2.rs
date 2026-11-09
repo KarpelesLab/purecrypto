@@ -816,7 +816,10 @@ impl Sm2PrivateKey {
         use crate::der::{Reader, parse_oid, tag};
         let mut outer = Reader::new(der);
         let mut seq = outer.read_sequence().map_err(|_| Error::Malformed)?;
-        seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version
+        // version: ecPrivkeyVer1 (RFC 5915 §3).
+        if seq.read_integer_bytes().map_err(|_| Error::Malformed)? != [1] {
+            return Err(Error::Malformed);
+        }
         let priv_bytes = seq.read_octet_string().map_err(|_| Error::Malformed)?;
         if seq.peek_tag() != Some(tag::context(0)) {
             return Err(Error::Malformed);
@@ -1153,6 +1156,13 @@ mod tests {
         ]
         .concat();
         assert_eq!(sk.to_sec1_der(), from_hex(&want));
+        // The version must be ecPrivkeyVer1 (30 77 02 01 vv).
+        let mut bad = from_hex(&want);
+        bad[4] = 2;
+        assert_eq!(
+            Sm2PrivateKey::from_sec1_der(&bad).err(),
+            Some(Error::Malformed)
+        );
     }
 
     /// The SEC1 / SPKI parsers must be as strict as the boxed EC ones: an

@@ -971,11 +971,12 @@ impl BoxedEcdsaSignature {
         &self.s
     }
 
-    /// The widest group order this crate supports, in bytes (P-521, 521 bits
-    /// → 66 bytes). Signature components parsed by
+    /// The widest group order this build supports, in bytes: 66 (P-521,
+    /// 521 bits), or 72 with the `ec-custom` feature, whose custom curves
+    /// may have an order of up to 576 bits. Signature components parsed by
     /// [`from_der`][Self::from_der] are bounded by this.
     #[cfg_attr(not(feature = "der"), doc = "", doc = "[Self::from_der]: crate")]
-    pub const MAX_ORDER_LEN: usize = 66;
+    pub const MAX_ORDER_LEN: usize = if cfg!(feature = "ec-custom") { 72 } else { 66 };
 
     /// The `r` component encoded big-endian, left-padded to
     /// `curve.order_len()` bytes (the SEC1 fixed-width encoding).
@@ -1173,7 +1174,8 @@ impl BoxedEcdsaSignature {
     ///
     /// `r` and `s` are additionally bounded to
     /// [`MAX_ORDER_LEN`](Self::MAX_ORDER_LEN) bytes of magnitude — the widest
-    /// group order this crate supports (P-521). The curve is not known at this
+    /// group order this build supports (P-521, or a 576-bit custom curve
+    /// with `ec-custom`). The curve is not known at this
     /// point, so the final range check is the verifier's `in_range`; the width
     /// bound is what keeps a hostile signature from reaching the fixed-width
     /// re-encoders. See [`Self::from_der_for_curve`] for the exact check.
@@ -1287,14 +1289,18 @@ impl BoxedEcdsaPrivateKey {
     /// Parses a SEC1 `ECPrivateKey` DER structure. The parameters are a
     /// supported named curve, or explicit ones (see [`BoxedCurve::from_der`]).
     ///
-    /// The OPTIONAL `[1]` publicKey is checked against the private scalar when
-    /// present (a key that disagrees with itself is rejected), and trailing
-    /// data after the structure is rejected.
+    /// The version must be `ecPrivkeyVer1` (1). The OPTIONAL `[1]` publicKey
+    /// is checked against the private scalar when present (a key that
+    /// disagrees with itself is rejected), and trailing data after the
+    /// structure is rejected.
     pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::{Reader, tag};
         let mut outer = Reader::new(der);
         let mut seq = outer.read_sequence().map_err(|_| Error::Malformed)?;
-        seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version
+        // version: ecPrivkeyVer1 (RFC 5915 §3).
+        if seq.read_integer_bytes().map_err(|_| Error::Malformed)? != [1] {
+            return Err(Error::Malformed);
+        }
         let priv_bytes = seq.read_octet_string().map_err(|_| Error::Malformed)?;
         if seq.peek_tag() != Some(tag::context(0)) {
             return Err(Error::Malformed);
@@ -1348,7 +1354,8 @@ impl BoxedEcdsaPrivateKey {
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958) wrapping a SEC1
     /// EC private key. The curve is taken from the `privateKeyAlgorithm`
     /// parameters (a named curve, or explicit ones — see
-    /// [`BoxedCurve::from_der`]).
+    /// [`BoxedCurve::from_der`]). The version must be 0 (v1) or 1 (v2,
+    /// `OneAsymmetricKey`), and the inner SEC1 version 1.
     ///
     /// The inner SEC1 structure's OPTIONAL fields are no longer skipped
     /// blindly: a `[0]` namedCurve must name the same curve as the PKCS#8
@@ -1360,7 +1367,12 @@ impl BoxedEcdsaPrivateKey {
         use crate::der::{Reader, parse_oid, tag};
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
-        seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version (0)
+        // version: v1 (0), or v2 (1) for an RFC 5958 `OneAsymmetricKey`,
+        // whose trailing `[1]` publicKey is accepted below.
+        let version = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        if version != [0] && version != [1] {
+            return Err(Error::Malformed);
+        }
         let mut algid = seq.read_sequence().map_err(|_| Error::Malformed)?;
         let alg = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
@@ -1375,7 +1387,10 @@ impl BoxedEcdsaPrivateKey {
         //                             [1] publicKey OPTIONAL }.
         let mut ir = Reader::new(inner);
         let mut iseq = ir.read_sequence().map_err(|_| Error::Malformed)?;
-        iseq.read_integer_bytes().map_err(|_| Error::Malformed)?; // SEC1 version (1)
+        // SEC1 version: ecPrivkeyVer1.
+        if iseq.read_integer_bytes().map_err(|_| Error::Malformed)? != [1] {
+            return Err(Error::Malformed);
+        }
         let priv_bytes = iseq.read_octet_string().map_err(|_| Error::Malformed)?;
         if iseq.peek_tag() == Some(tag::context(0)) {
             // RFC 5915 §3 requires this to be omitted inside PKCS#8; if it is
@@ -2584,9 +2599,9 @@ x2dqVh/sT12MnE=\n\
     fn oversize_der_signature_rejected_at_parse() {
         use crate::der::{encode_integer, encode_sequence};
 
-        // SEQUENCE { INTEGER(67 bytes), INTEGER(1) } — one byte wider than
-        // P-521's order.
-        let wide = [0x7fu8; 67];
+        // SEQUENCE { INTEGER(67 or 73 bytes), INTEGER(1) } — one byte wider
+        // than the widest order (P-521's, or a 576-bit custom curve's).
+        let wide = [0x7fu8; BoxedEcdsaSignature::MAX_ORDER_LEN + 1];
         let der = encode_sequence(&[encode_integer(&wide), encode_integer(&[1])].concat());
         assert!(matches!(
             BoxedEcdsaSignature::from_der(&der),
@@ -2859,6 +2874,84 @@ x2dqVh/sT12MnE=\n\
         // the 30 xx 02 01 01 04 30 header.
         let pos = der.windows(2).position(|w| w == [0x04, 48]).unwrap();
         assert_eq!(&der[pos + 2..pos + 2 + 48], &d[..]);
+    }
+
+    /// The SEC1 and PKCS#8 parsers check the version INTEGERs: SEC1 must be
+    /// `ecPrivkeyVer1`, PKCS#8 v1 or v2.
+    #[cfg(feature = "der")]
+    #[test]
+    fn private_key_parsers_check_the_version() {
+        let d: Vec<u8> = (1..=32u8).collect();
+        let sk = BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).unwrap();
+        let public = sk.public_key().to_sec1();
+
+        // SEQUENCE { INTEGER version, ... }: the version byte is at offset 4
+        // (30 77 02 01 vv).
+        let sec1 = sk.to_sec1_der();
+        assert_eq!(sec1[2..5], [0x02, 0x01, 0x01]);
+        for v in [0u8, 2, 0x7f] {
+            let mut bad = sec1.clone();
+            bad[4] = v;
+            assert_eq!(
+                BoxedEcdsaPrivateKey::from_sec1_der(&bad).err(),
+                Some(Error::Malformed),
+                "SEC1 version {v}"
+            );
+        }
+
+        // PKCS#8: 30 81 93 02 01 vv — the version byte is at offset 5.
+        let p8 = sk.to_pkcs8_der();
+        assert_eq!(p8[3..6], [0x02, 0x01, 0x00]);
+        // v2 (OneAsymmetricKey) is accepted, as its trailing fields are.
+        let mut v2 = p8.clone();
+        v2[5] = 1;
+        let parsed = BoxedEcdsaPrivateKey::from_pkcs8_der(&v2).unwrap();
+        assert_eq!(parsed.public_key().to_sec1(), public);
+        for v in [2u8, 0x7f] {
+            let mut bad = p8.clone();
+            bad[5] = v;
+            assert_eq!(
+                BoxedEcdsaPrivateKey::from_pkcs8_der(&bad).err(),
+                Some(Error::Malformed),
+                "PKCS#8 version {v}"
+            );
+        }
+        // The inner SEC1 version, at the start of the privateKey OCTET
+        // STRING (… 04 79 30 77 02 01 vv).
+        let at = p8.len() - sec1.len() + 4;
+        assert_eq!(p8[at - 2..=at], [0x02, 0x01, 0x01]);
+        let mut bad = p8.clone();
+        bad[at] = 0;
+        assert_eq!(
+            BoxedEcdsaPrivateKey::from_pkcs8_der(&bad).err(),
+            Some(Error::Malformed)
+        );
+    }
+
+    /// `from_der` bounds `r` and `s` by the widest order the build
+    /// supports: P-521's 66 bytes, or 72 (576 bits) once `ec-custom` can
+    /// build a curve that wide — whose own signatures must parse back.
+    #[cfg(feature = "der")]
+    #[test]
+    fn der_signature_width_cap_matches_the_widest_order() {
+        let max = BoxedEcdsaSignature::MAX_ORDER_LEN;
+        assert_eq!(max, if cfg!(feature = "ec-custom") { 72 } else { 66 });
+        let sig = |len: usize| {
+            use crate::der::{encode_integer, encode_sequence};
+            encode_sequence(&[encode_integer(&vec![0xff; len]), encode_integer(&[1])].concat())
+        };
+        let parsed = BoxedEcdsaSignature::from_der(&sig(max)).unwrap();
+        assert_eq!(parsed.r().bit_len(), 8 * max);
+        assert_eq!(
+            BoxedEcdsaSignature::from_der(&sig(max + 1)).err(),
+            Some(Error::Malformed)
+        );
+        // With the curve known, the bound is that curve's order width.
+        assert!(BoxedEcdsaSignature::from_der_for_curve(&sig(32), CurveId::P256).is_ok());
+        assert_eq!(
+            BoxedEcdsaSignature::from_der_for_curve(&sig(33), CurveId::P256).err(),
+            Some(Error::Malformed)
+        );
     }
 
     /// The private-key encoders' output is pinned byte for byte (captured

@@ -556,7 +556,11 @@ impl PublicKey for BoxedEcdsaPublicKey {
                 let s = BoxedUint::from_be_bytes(&sig[olen..]);
                 BoxedEcdsaSignature::from_components(r, s)
             }
-            SigEncoding::Der => BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?,
+            // The curve is known: bound `r`/`s` by its own order width (a
+            // custom curve's can exceed the named curves' 66 bytes).
+            SigEncoding::Der => {
+                BoxedEcdsaSignature::from_der_for_curve(sig, curve).map_err(|_| Error::Signature)?
+            }
         };
         if prehashed {
             self.verify_prehash(msg, &signature)
