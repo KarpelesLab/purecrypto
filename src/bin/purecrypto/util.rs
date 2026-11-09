@@ -30,14 +30,28 @@ fn release_held_locks() {
     }
 }
 
-/// Prints `purecrypto: <msg>` to stderr and exits with status 1.
+/// The exit status [`die`] uses; see [`set_error_exit_status`].
+static ERROR_EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+/// Makes every later [`die`] in this process exit with `status` instead of 1.
+///
+/// For a subcommand whose exit status carries an answer — `crl -is-revoked`
+/// exits 1 for "not revoked" — so that an *error* anywhere underneath it
+/// (an unreadable file in [`read_input`], a usage error in [`Args`]) can
+/// never be mistaken for that answer. Call it first thing in the subcommand.
+pub(crate) fn set_error_exit_status(status: i32) {
+    ERROR_EXIT_STATUS.store(status, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Prints `purecrypto: <msg>` to stderr and exits with status 1 (or the
+/// status a subcommand chose with [`set_error_exit_status`]).
 ///
 /// Releases any held [`SentinelLock`] first: `exit` skips `Drop`, and a
 /// leaked sentinel blocks every subsequent run for 30 s before failing.
 pub(crate) fn die(msg: impl AsRef<str>) -> ! {
     release_held_locks();
     eprintln!("purecrypto: {}", msg.as_ref());
-    exit(1);
+    exit(ERROR_EXIT_STATUS.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 /// Parses a TLS identity private key from PEM in every form the stack can

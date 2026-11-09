@@ -8733,3 +8733,174 @@ fn enc_key_wrap_refuses_aad() {
     let (_out, err, ok) = run_capture(&["enc", "-alg", "AES-256-KW", "-key", key], &[0x42; 16]);
     assert!(ok, "{err}");
 }
+
+/// Runs the CLI with no stdin and returns `(stdout, stderr, exit code)`.
+fn run_status(args: &[&str]) -> (String, String, Option<i32>) {
+    let out = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn purecrypto");
+    assert_ne!(out.status.code(), Some(101), "the CLI panicked: {out:?}");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// `crl` used to (1) stop after the first mode it recognised, so
+/// `-CAfile ca -verify -text` printed the text and exited 0 without ever
+/// verifying and `-verify -is-revoked` never consulted the list; (2) exit 1
+/// both for "not revoked" and for every error, so `crl -is-revoked … &&
+/// reject` read an unreadable CRL as "not revoked"; (3) look serials up
+/// un-normalised, so `-serial 0x0000<revoked>` reported "not revoked", and
+/// print them as unprefixed hex that `-serial` reads back as decimal.
+#[test]
+fn crl_runs_every_mode_and_separates_errors_from_not_revoked() {
+    let (dir, p) = ca_with_leaf_key("crlmodes");
+    let d = dir.to_str().unwrap().to_string();
+    // A second, unrelated CA: the wrong trust anchor for the first one's CRL.
+    let other = dir.join("other");
+    let other_s = other.to_str().unwrap().to_string();
+    assert!(run(&["ca", "init", "-dir", &other_s, "-cn", "Other CA"], b"").1);
+    let wrong_ca = other.join("root.crt").to_str().unwrap().to_string();
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "leaf.test",
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "{err}");
+    let serial = issued_serial(&err);
+    assert!(
+        run(
+            &["ca", "revoke", "-dir", &d, "-serial", &serial.to_string()],
+            b""
+        )
+        .1
+    );
+    assert!(run(&["ca", "crl", "-dir", &d, "-out", &p("ca.crl")], b"").1);
+    let crl = p("ca.crl");
+    let ca = p("root.crt");
+
+    // (1) Every requested mode runs, verification first and fatal.
+    let (out, err, code) =
+        run_status(&["crl", "-in", &crl, "-CAfile", &wrong_ca, "-verify", "-text"]);
+    assert_eq!(
+        code,
+        Some(2),
+        "wrong CA must fail -verify -text: {out}{err}"
+    );
+    assert!(err.contains("verify FAIL"), "{err}");
+    assert!(
+        !out.contains("Revoked entries"),
+        "text of an unverified CRL was printed: {out}"
+    );
+    let (out, _err, code) = run_status(&["crl", "-in", &crl, "-CAfile", &ca, "-verify", "-text"]);
+    assert_eq!(code, Some(0));
+    assert!(
+        out.contains("verify OK") && out.contains("Revoked entries: 1"),
+        "{out}"
+    );
+    // `-verify -is-revoked` consults the list (it used to stop at "verify OK")…
+    let (out, _err, code) = run_status(&[
+        "crl",
+        "-in",
+        &crl,
+        "-CAfile",
+        &ca,
+        "-verify",
+        "-is-revoked",
+        "-serial",
+        "999",
+    ]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("verify OK") && out.contains("not revoked"),
+        "{out}"
+    );
+    // …and a list that fails verification gives no answer at all.
+    let (out, _err, code) = run_status(&[
+        "crl",
+        "-in",
+        &crl,
+        "-CAfile",
+        &wrong_ca,
+        "-verify",
+        "-is-revoked",
+        "-serial",
+        "999",
+    ]);
+    assert_eq!(code, Some(2));
+    assert!(!out.contains("revoked"), "{out}");
+    // `-CAfile` alone verifies too, rather than being silently ignored.
+    let (_out, err, code) = run_status(&[
+        "crl",
+        "-in",
+        &crl,
+        "-CAfile",
+        &wrong_ca,
+        "-is-revoked",
+        "-serial",
+        "999",
+    ]);
+    assert_eq!(code, Some(2), "{err}");
+
+    // (2) 0 revoked / 1 not revoked / 2 error.
+    let dec = serial.to_string();
+    let (out, _e, code) = run_status(&["crl", "-in", &crl, "-is-revoked", "-serial", &dec]);
+    assert_eq!((out.trim(), code), ("revoked", Some(0)));
+    let (out, _e, code) = run_status(&["crl", "-in", &crl, "-is-revoked", "-serial", "999"]);
+    assert_eq!((out.trim(), code), ("not revoked", Some(1)));
+    let missing = p("missing.crl");
+    std::fs::write(dir.join("corrupt.crl"), b"not a CRL").unwrap();
+    let corrupt = p("corrupt.crl");
+    for argv in [
+        vec!["crl", "-in", &missing, "-is-revoked", "-serial", &dec],
+        vec!["crl", "-in", &corrupt, "-is-revoked", "-serial", &dec],
+        vec!["crl", "-in", &crl, "-is-revoked", "-serial", "0xnothex"],
+        vec!["crl", "-in", &crl, "-is-revoked"],
+        vec!["crl", "-in", &crl, "-is-revoked", "-serial"],
+        vec!["crl", "-in", &crl, "-verify"],
+        vec!["crl", "-in", &crl],
+    ] {
+        let (out, err, code) = run_status(&argv);
+        assert_eq!(code, Some(2), "{argv:?} must be an error (2): {out}{err}");
+        assert!(!out.contains("revoked"), "{argv:?}: {out}");
+    }
+
+    // (3) Serials are normalised, in every spelling of the same number.
+    for form in [
+        format!("{serial:#x}"),
+        format!("0x0000{serial:x}"),
+        format!("0x{serial:040x}"),
+        format!("0X{serial:X}"),
+    ] {
+        let (out, _e, code) = run_status(&["crl", "-in", &crl, "-is-revoked", "-serial", &form]);
+        assert_eq!((out.trim(), code), ("revoked", Some(0)), "-serial {form}");
+    }
+    // What `-text` prints is what `-serial` takes.
+    let (out, _e, code) = run_status(&["crl", "-in", &crl, "-text"]);
+    assert_eq!(code, Some(0));
+    let shown = out
+        .split("serial=")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no serial in -text output: {out}"));
+    assert_eq!(shown, format!("{serial:#x}"), "{out}");
+    let (out, _e, code) = run_status(&["crl", "-in", &crl, "-is-revoked", "-serial", shown]);
+    assert_eq!((out.trim(), code), ("revoked", Some(0)));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

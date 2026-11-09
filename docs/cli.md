@@ -403,7 +403,32 @@ not SHA-1/MD5-based.
 purecrypto crl -in crl.pem -text
 purecrypto crl -in crl.pem -verify -CAfile ca.crt
 purecrypto crl -in crl.pem -is-revoked -serial 0x1A2B
+# Modes combine: verify, then print, then look the serial up.
+purecrypto crl -in crl.pem -CAfile ca.crt -verify -text -is-revoked -serial 0x1A2B
 ```
+
+Every requested mode runs, in a fixed order: the signature check first, then
+`-text`, then `-is-revoked`. A failed signature check is fatal — neither the
+text nor a revocation answer is printed for a list that did not verify.
+Giving `-CAfile` verifies the list whether or not `-verify` is spelled out;
+without `-CAfile` the list is used as-is, unauthenticated.
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | Success. With `-is-revoked`: the serial **is** revoked. |
+| `1` | `-is-revoked` only: the serial is **not** revoked. |
+| `2` | Any error: bad usage, an unreadable or unparsable CRL or CA file, an invalid `-serial`, a failed signature check. |
+
+An error is therefore never mistaken for "not revoked":
+`purecrypto crl ... -is-revoked; [ $? -eq 1 ]` is true only for a list that
+was read (and, with `-CAfile`, verified) and does not contain the serial.
+
+`-serial` takes `0x`-prefixed hex (`0x1A2B`, the form `-text` prints and the
+form `ca issue` reports; `:` separators allowed), a decimal number (all
+digits, no prefix: `6699`), or bare hex containing at least one letter
+(`1a2b`). Leading zeros are ignored, so `0x00001A2B` is the same serial.
+`-text` prints each entry as `serial=0x...`; an unprefixed all-digit string
+is always read as decimal, so copy the prefix along.
 
 ## `s_client` / `s_server`
 
