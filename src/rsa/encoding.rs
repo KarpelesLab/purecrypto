@@ -29,31 +29,14 @@ fn rsa_encryption_algid() -> Vec<u8> {
     encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat())
 }
 
-/// Writes a DER tag and definite-form length into `out`.
-fn push_header(out: &mut Vec<u8>, tag: u8, len: usize) {
-    out.push(tag);
-    if len < 0x80 {
-        out.push(len as u8);
-        return;
-    }
-    let n = (usize::BITS - len.leading_zeros()).div_ceil(8) as usize;
-    out.push(0x80 | n as u8);
-    for i in (0..n).rev() {
-        out.push((len >> (8 * i)) as u8);
-    }
-}
-
-/// Upper bound on a DER tag + length header.
-const MAX_HEADER: usize = 2 + core::mem::size_of::<usize>();
+// The wipe-on-drop DER encoders live in `crate::der` (shared with `dsa`);
+// these are the names the RSA export code uses for them.
 
 /// [`crate::der::encode_tlv`] for secret content: the result is allocated
 /// once at its final size (so no reallocation leaves an unwiped copy behind)
 /// and is wiped on drop.
 pub(super) fn secret_tlv(tag: u8, content: &[u8]) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::with_capacity(content.len() + MAX_HEADER));
-    push_header(&mut out, tag, content.len());
-    out.extend_from_slice(content);
-    out
+    Zeroizing::der_tlv(tag, content)
 }
 
 /// [`encode_integer`] for secret values: same canonical DER `INTEGER`
@@ -61,37 +44,19 @@ pub(super) fn secret_tlv(tag: u8, content: &[u8]) -> Zeroizing<Vec<u8>> {
 /// encoded as zero), built without the intermediate content buffer the
 /// generic encoder frees unwiped.
 pub(super) fn secret_integer(unsigned_be: &[u8]) -> Zeroizing<Vec<u8>> {
-    let start = unsigned_be
-        .iter()
-        .position(|&b| b != 0)
-        .unwrap_or(unsigned_be.len().saturating_sub(1));
-    let trimmed = unsigned_be.get(start..).unwrap_or(&[]);
-    let trimmed: &[u8] = if trimmed.is_empty() { &[0] } else { trimmed };
-    let pad = usize::from(trimmed[0] & 0x80 != 0);
-    let len = trimmed.len() + pad;
-    let mut out = Zeroizing::new(Vec::with_capacity(len + MAX_HEADER));
-    push_header(&mut out, crate::der::tag::INTEGER, len);
-    if pad == 1 {
-        out.push(0);
-    }
-    out.extend_from_slice(trimmed);
-    out
+    Zeroizing::der_integer(unsigned_be)
 }
 
 /// Concatenates already-encoded secret elements into one buffer allocated
 /// at its final size and wiped on drop.
 pub(super) fn secret_concat(parts: &[&[u8]]) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::with_capacity(parts.iter().map(|p| p.len()).sum()));
-    for p in parts {
-        out.extend_from_slice(p);
-    }
-    out
+    Zeroizing::der_concat(parts)
 }
 
 /// Moves the encoding out of its wrapper for a caller that takes ownership
 /// of it (the wrapper is left holding an empty vector).
-pub(super) fn into_plain(mut z: Zeroizing<Vec<u8>>) -> Vec<u8> {
-    core::mem::take(&mut *z)
+pub(super) fn into_plain(z: Zeroizing<Vec<u8>>) -> Vec<u8> {
+    z.into_plain()
 }
 
 /// [`uint_be`] for a secret value, wiped on drop.

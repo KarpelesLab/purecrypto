@@ -98,12 +98,11 @@
 use crate::bignum::{BoxedMontModulus, BoxedUint, inv_mod_odd_ct_boxed};
 use crate::ct::ConstantTimeEq;
 use crate::der::{
-    Reader, encode_bit_string, encode_integer, encode_octet_string, encode_sequence, oid_tlv,
-    parse_oid, tag,
+    Reader, encode_bit_string, encode_integer, encode_sequence, oid_tlv, parse_oid, tag,
 };
 use crate::hash::{Digest, HashAlgorithm, Hmac};
 use crate::rng::{CryptoRng, RngCore};
-use crate::zeroize::Zeroize;
+use crate::zeroize::{Zeroize, Zeroizing};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1031,15 +1030,18 @@ impl DsaPrivateKey {
     /// version 0, `id-dsa` with `Dss-Parms`, and a DER `INTEGER x` in the
     /// `privateKey` OCTET STRING — the layout `openssl pkcs8` writes.
     pub fn to_pkcs8_der(&self) -> Vec<u8> {
-        let x = encode_integer(&self.x_bytes());
-        encode_sequence(
-            &[
-                encode_integer(&[0]),
-                self.params.algorithm_identifier(),
-                encode_octet_string(&x),
-            ]
-            .concat(),
-        )
+        // Every buffer that holds `x` (its big-endian bytes, the INTEGER,
+        // the OCTET STRING, the concatenated body) is allocated once at its
+        // final size and wiped on drop; only the returned encoding outlives
+        // this call.
+        let x = Zeroizing::der_integer(&Zeroizing::new(self.x_bytes()));
+        let key = Zeroizing::der_tlv(tag::OCTET_STRING, &x);
+        let body = Zeroizing::der_concat(&[
+            &encode_integer(&[0]),
+            &self.params.algorithm_identifier(),
+            &key,
+        ]);
+        Zeroizing::der_tlv(tag::SEQUENCE, &body).into_plain()
     }
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` wrapping a DSA key.
@@ -1105,19 +1107,25 @@ impl DsaPrivateKey {
     /// [`to_pkcs8_der`](Self::to_pkcs8_der) as a `-----BEGIN PRIVATE KEY-----`
     /// PEM document.
     pub fn to_pkcs8_pem(&self) -> String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+        crate::der::pem_encode("PRIVATE KEY", &Zeroizing::new(self.to_pkcs8_der()))
     }
 
     /// Parses a `-----BEGIN PRIVATE KEY-----` PEM document.
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        // The decoded DER holds `x` in the clear: wipe it on every return.
+        let der = Zeroizing::new(
+            crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der(&der)
     }
 
     /// [`from_pkcs8_pem`](Self::from_pkcs8_pem) under the
     /// [`DsaParams::new_nonstandard`] width rules.
     pub fn from_pkcs8_pem_nonstandard(pem: &str) -> Result<Self, Error> {
-        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        // The decoded DER holds `x` in the clear: wipe it on every return.
+        let der = Zeroizing::new(
+            crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?,
+        );
         Self::from_pkcs8_der_nonstandard(&der)
     }
 }
@@ -1266,6 +1274,7 @@ const RFC6979_2048_G: &str = "5C7FF6B06F8F143FE8288433493E4769C4D988ACE5BE25A0E2
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::der::encode_octet_string;
     use crate::hash::{Sha1, Sha224, Sha256, Sha384, Sha512};
     use crate::rng::HmacDrbg;
 
@@ -1843,6 +1852,52 @@ mod tests {
         let dbg = alloc::format!("{key:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.to_lowercase().contains(&X1024.to_lowercase()));
+    }
+
+    #[test]
+    fn pkcs8_der_matches_generic_encoders() {
+        // The wipe-on-drop export path must emit exactly the bytes of the
+        // generic `crate::der` writers it replaced, whatever the shape of
+        // `x`: high bit set (INTEGER gets a 0x00 pad), leading zero bytes
+        // (trimmed), and the smallest value.
+        let old = |key: &DsaPrivateKey| {
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    key.params.algorithm_identifier(),
+                    encode_octet_string(&encode_integer(&key.x_bytes())),
+                ]
+                .concat(),
+            )
+        };
+        let mut high = [0u8; 20];
+        high[0] = 0x80;
+        high[19] = 1;
+        let mut low = [0u8; 20];
+        low[7] = 0x80;
+        let mut one = [0u8; 20];
+        one[19] = 1;
+        for x in [from_hex(X1024), high.to_vec(), low.to_vec(), one.to_vec()] {
+            let key = DsaPrivateKey::from_be_bytes(params_1024(), &x).unwrap();
+            let der = key.to_pkcs8_der();
+            assert_eq!(der, old(&key));
+            assert_eq!(
+                DsaPrivateKey::from_pkcs8_der(&der).unwrap().x_bytes(),
+                key.x_bytes()
+            );
+            assert_eq!(
+                crate::der::pem_decode(&key.to_pkcs8_pem(), "PRIVATE KEY").unwrap(),
+                der
+            );
+        }
+        // A fixed vector, independent of either encoder: the tail of the
+        // RFC 6979 A.2.1 key's PrivateKeyInfo is
+        // OCTET STRING { INTEGER x } = 04 16 02 14 || x.
+        let der = key_1024().to_pkcs8_der();
+        let mut tail = vec![0x04, 0x16, 0x02, 0x14];
+        tail.extend_from_slice(&from_hex(X1024));
+        assert!(der.ends_with(&tail));
+        assert_eq!(der[0], 0x30);
     }
 
     #[test]
