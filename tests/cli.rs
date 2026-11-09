@@ -8442,3 +8442,176 @@ fn psk_file_and_argv_secret_warnings() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sets up a scratch CA and a leaf key pair (`leaf.key` / `leaf.pub`).
+fn ca_with_leaf_key(tag: &str) -> (std::path::PathBuf, impl Fn(&str) -> String) {
+    let dir = std::env::temp_dir().join(format!("pc_cli_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir2 = dir.clone();
+    let p = move |name: &str| dir2.join(name).to_str().unwrap().to_string();
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Arg CA"],
+            b""
+        )
+        .1,
+        "ca init failed"
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey failed"
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok, "pkey -pubout failed");
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+    (dir, p)
+}
+
+/// Argument injection: a flag's *value* used to be matched as a flag too, so
+/// a wrapper running `ca issue … -cn "$name"` with `name="-ca"` got
+/// `-cn`'s value AND the `-ca` flag — a CA:TRUE certificate for the
+/// requester's key. The value is now only a value: the result is a leaf
+/// whose commonName is literally `-ca`.
+#[test]
+fn ca_issue_flag_shaped_value_is_not_a_flag() {
+    use purecrypto::x509::Certificate;
+    let (dir, p) = ca_with_leaf_key("arginject");
+    let d = dir.to_str().unwrap().to_string();
+    let pubkey = p("leaf.pub");
+
+    for (out, want, argv) in [
+        (
+            "spaced.crt",
+            "CN=-ca",
+            vec!["ca", "issue", "-dir", &d, "-pubkey", &pubkey, "-cn", "-ca"],
+        ),
+        // The attached form carries the same value.
+        (
+            "attached.crt",
+            "CN=-ca",
+            vec!["ca", "issue", "-dir", &d, "-pubkey", &pubkey, "-cn=-ca"],
+        ),
+        // So does `--ca`, and a value that is not the last token.
+        (
+            "ddash.crt",
+            "CN=--ca",
+            vec!["ca", "issue", "-dir", &d, "-cn", "--ca", "-pubkey", &pubkey],
+        ),
+    ] {
+        let out_path = p(out);
+        let mut argv = argv;
+        argv.extend(["-out", &out_path]);
+        let (_o, err, ok) = run_capture(&argv, b"");
+        assert!(ok, "{argv:?} failed: {err}");
+        let cert = Certificate::from_pem(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        let is_ca = cert.basic_constraints().unwrap().is_some_and(|bc| bc.0);
+        assert!(!is_ca, "{argv:?} issued a CA certificate");
+        let (text, ok) = run(&["x509", "-in", &out_path, "-text"], b"");
+        assert!(ok);
+        assert!(
+            text.contains(want),
+            "{argv:?}: subject is not {want}: {text}"
+        );
+    }
+
+    // The flag proper still makes a CA.
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &pubkey,
+            "-cn",
+            "Sub CA",
+            "-ca",
+            "-out",
+            &p("sub.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "ca issue -ca failed: {err}");
+    let sub = Certificate::from_pem(&std::fs::read_to_string(p("sub.crt")).unwrap()).unwrap();
+    assert!(sub.basic_constraints().unwrap().is_some_and(|bc| bc.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ca sign-csr -ca -template <leaf template>` issues a leaf (an explicit
+/// `-template` wins over the `-ca` shorthand) but used to skip the
+/// requester-chosen-commonName guard, which keyed on the `-ca` flag instead
+/// of on what the resolved template issues.
+#[test]
+fn ca_sign_csr_ca_flag_with_leaf_template_keeps_the_cn_guard() {
+    let (dir, p) = ca_with_leaf_key("caflagguard");
+    let d = dir.to_str().unwrap().to_string();
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=*.bank.example",
+                "-out",
+                &p("wild.csr"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            &d,
+            "-in",
+            &p("wild.csr"),
+            "-ca",
+            "-template",
+            "tls-server",
+            "-out",
+            &p("wild.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "-ca -template tls-server skipped the commonName guard");
+    assert!(
+        err.contains("commonName") && err.contains("*.bank.example"),
+        "expected a commonName diagnostic, got: {err}"
+    );
+    assert!(!dir.join("wild.crt").exists());
+
+    // A template that really issues a CA is not subject to the leaf guard,
+    // with or without the `-ca` shorthand.
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            &d,
+            "-in",
+            &p("wild.csr"),
+            "-template",
+            "ca-intermediate",
+            "-out",
+            &p("int.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "ca-intermediate template must still issue: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

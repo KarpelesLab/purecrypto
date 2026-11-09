@@ -25,6 +25,15 @@ Two conventions apply across the tool:
   not.
 - **Positional arguments beyond what a subcommand takes are refused** with
   `unexpected argument(s): ...` rather than silently ignored.
+- **A flag's value is only ever a value.** The token after a value-taking
+  flag is taken verbatim, even when it looks like a flag, and is never also
+  read as one: `ca issue ... -cn -ca` issues a leaf whose commonName is the
+  literal string `-ca` (it does not turn on `-ca`), and
+  `s_client -servername -insecure` sends the SNI `-insecure` and still
+  verifies the certificate. A script may therefore pass untrusted text as a
+  flag's value (`-cn "$name"`). The attached form `-flag=VALUE` is accepted
+  for every value-taking flag, and a bare `--` ends the options: everything
+  after it is positional.
 
 ## Contents
 
@@ -365,7 +374,10 @@ subjectAltName is not certified unless `-copy-csr-san` is given, and a leaf
 with no vetted SAN whose CSR commonName looks like a DNS name, wildcard, or
 IP literal is refused. `-subj "/CN=..."` replaces the request's whole subject
 with an operator-supplied one; `-allow-cn-hostname` is the escape hatch that
-certifies the host-like commonName anyway.
+certifies the host-like commonName anyway. The check applies whenever the
+certificate being issued is not a CA: `-ca` is shorthand for
+`-template ca-intermediate`, an explicit `-template` wins over it, and
+`-ca -template tls-server` is therefore a leaf and vetted like one.
 
 Submitted CSRs must also carry a >= 2048-bit RSA key and a signature that is
 not SHA-1/MD5-based.

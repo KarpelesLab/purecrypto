@@ -449,14 +449,12 @@ fn kw_unwrap(alg: Algo, kek: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&[
+        "-alg", "-key", "-keyfile", "-in", "-out", "-nonce", "-iv", "-aad", "-aadfile",
+    ]);
     // `enc` takes no positional arguments: the input is `-in` (default
     // stdin). A stray one used to be ignored.
-    reject_extra_positionals(
-        &args.positionals(&[
-            "-alg", "-key", "-keyfile", "-in", "-out", "-nonce", "-iv", "-aad", "-aadfile",
-        ]),
-        0,
-    );
+    reject_extra_positionals(&args.positionals(), 0);
     let alg_name = args
         .value("-alg")
         .or_else(|| args.value("--alg"))

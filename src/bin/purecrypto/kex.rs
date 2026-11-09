@@ -50,7 +50,8 @@ fn curve_from_arcs(arcs: &[u64]) -> Option<CurveId> {
 }
 
 pub(crate) fn run(args: Args) {
-    reject_extra_positionals(&args.positionals(&["-alg", "-key", "-peer", "-out"]), 0);
+    let args = args.declare(&["-alg", "-key", "-peer", "-out"]);
+    reject_extra_positionals(&args.positionals(), 0);
     let alg = args
         .value("-alg")
         .or_else(|| args.value("--alg"))

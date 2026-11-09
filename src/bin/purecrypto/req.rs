@@ -17,6 +17,16 @@ fn sans_from_args(args: &Args) -> Vec<String> {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&[
+        "-addext",
+        "-san",
+        "-in",
+        "-key",
+        "-subj",
+        "-template",
+        "-template-file",
+        "-out",
+    ]);
     // Inspect mode: -in <csr>.
     if let Some(path) = args.value("-in").or_else(|| args.value("--in")) {
         let raw = read_input(Some(path));

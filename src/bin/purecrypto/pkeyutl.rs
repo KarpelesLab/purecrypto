@@ -40,18 +40,13 @@ default signer identity (1234567812345678).";
 
 /// Returns all `-pkeyopt key:value` entries.
 fn pkeyopts(args: &Args) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    // Args treats every occurrence of `-pkeyopt`'s value: walk argv ourselves.
-    let mut iter = args.tokens_iter();
-    while let Some(t) = iter.next() {
-        if (t == "-pkeyopt" || t == "--pkeyopt")
-            && let Some(v) = iter.next()
-        {
-            let (k, val) = v.split_once(':').unwrap_or((v.as_str(), ""));
-            out.push((k.to_string(), val.to_string()));
-        }
-    }
-    out
+    args.values("-pkeyopt")
+        .into_iter()
+        .map(|v| {
+            let (k, val) = v.split_once(':').unwrap_or((v, ""));
+            (k.to_string(), val.to_string())
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -742,20 +737,8 @@ fn report_verify(ok: bool) {
 }
 
 pub(crate) fn run(args: Args) {
-    let pos = args.positionals(&[
-        "-inkey",
-        "--inkey",
-        "-in",
-        "--in",
-        "-out",
-        "--out",
-        "-sigfile",
-        "--sigfile",
-        "-pkeyopt",
-        "--pkeyopt",
-        "-id",
-        "--id",
-    ]);
+    let args = args.declare(&["-inkey", "-in", "-out", "-sigfile", "-pkeyopt", "-id"]);
+    let pos = args.positionals();
     let sub = pos.first().copied().unwrap_or("");
     reject_extra_positionals(&pos, 1);
     match sub {

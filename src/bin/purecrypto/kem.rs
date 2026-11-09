@@ -176,24 +176,17 @@ fn run_decaps(args: Args) {
 }
 
 pub(crate) fn run(args: Args) {
-    let pos = args.positionals(&[
+    let args = args.declare(&[
         "-alg",
-        "--alg",
         "-out-secret",
-        "--out-secret",
         "-out-public",
-        "--out-public",
         "-peer",
-        "--peer",
         "-out-ct",
-        "--out-ct",
         "-out-ss",
-        "--out-ss",
         "-key",
-        "--key",
         "-ct",
-        "--ct",
     ]);
+    let pos = args.positionals();
     let sub = pos.first().copied().unwrap_or("");
     reject_extra_positionals(&pos, 1);
     match sub {

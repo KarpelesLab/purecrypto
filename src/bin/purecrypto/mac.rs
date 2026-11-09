@@ -82,6 +82,7 @@ fn mac_tag(alg: &str, key: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&["-alg", "-key", "-keyfile", "-nonce", "-in", "-out"]);
     let alg = args
         .value("-alg")
         .or_else(|| args.value("--alg"))
@@ -102,20 +103,7 @@ pub(crate) fn run(args: Args) {
         die("missing -key HEX or -keyfile FILE (raw bytes)");
     };
 
-    let pos = args.positionals(&[
-        "-alg",
-        "--alg",
-        "-key",
-        "--key",
-        "-keyfile",
-        "--keyfile",
-        "-nonce",
-        "--nonce",
-        "-in",
-        "--in",
-        "-out",
-        "--out",
-    ]);
+    let pos = args.positionals();
     let in_flag = args.value("-in").or_else(|| args.value("--in"));
     // The message is `-in FILE` or a single positional, never both.
     reject_extra_positionals(&pos, usize::from(in_flag.is_none()));

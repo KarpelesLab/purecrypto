@@ -637,10 +637,19 @@ fn run_sign_csr(args: Args) {
     // hostname verification then falls back to the CN — so a CSR asking for
     // `CN=*.bank.example` would be certified for that name. Screen before
     // `allocate_index`: a refused request must not consume an audit index.
+    //
+    // Whether that applies is decided by what will actually be issued, not
+    // by the `-ca` flag: `-ca -template tls-server` resolves to a leaf
+    // profile (an explicit `-template` wins over the `-ca` shorthand), and
+    // keying the guard on the flag let that combination skip it.
     let tmpl_names_sans = template
         .as_ref()
         .is_some_and(|t| !t.san_explicit.is_empty());
-    if !is_ca_flag && !subject_is_operators {
+    let issues_ca = match &template {
+        Some(t) => t.basic_constraints.is_some_and(|bc| bc.ca),
+        None => is_ca_flag,
+    };
+    if !issues_ca && !subject_is_operators {
         guard_requester_chosen_cn(
             &subject_from_csr,
             !sans.is_empty() || tmpl_names_sans,
@@ -1109,7 +1118,7 @@ NOTES:
 ";
 
 pub(crate) fn run(args: Args) {
-    let positionals = args.positionals(&[
+    let args = args.declare(&[
         "-dir",
         "-cn",
         "-algorithm",
@@ -1127,6 +1136,7 @@ pub(crate) fn run(args: Args) {
         "-template",
         "-template-file",
     ]);
+    let positionals = args.positionals();
     let sub = positionals.first().copied().unwrap_or("");
     crate::util::reject_extra_positionals(&positionals, 1);
 

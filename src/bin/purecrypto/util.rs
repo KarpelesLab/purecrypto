@@ -81,31 +81,117 @@ pub(crate) fn signing_key_from_pem(pem: &str) -> Option<purecrypto::tls::Signing
         .map(SigningKey::Ed448)
 }
 
-/// A trivial argument view over the tokens following the subcommand.
+/// What one argv token is. Decided once, left to right, when a subcommand
+/// declares its value-taking flags ([`Args::declare`]); every accessor then
+/// works off this classification, so a token is exactly one thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// A boolean flag (`-text`), declared or not.
+    Flag,
+    /// A declared value-taking flag; the next token is its [`Kind::Value`].
+    ValueFlag,
+    /// The value of the preceding [`Kind::ValueFlag`], whatever it looks
+    /// like — `-cn -ca` makes `-ca` a value, never a flag.
+    Value,
+    /// A declared value-taking flag with its value attached (`-cn=NAME`);
+    /// the payload is the byte offset of the `=`.
+    Inline(usize),
+    /// A positional argument.
+    Positional,
+    /// The `--` end-of-options marker: everything after it is positional.
+    Terminator,
+}
+
+/// An argument view over the tokens following the subcommand.
+///
+/// The view is *value-aware*: a subcommand first [`declare`](Args::declare)s
+/// which of its flags take a value, and the tokens are then classified in a
+/// single left-to-right pass. A token consumed as a flag's value is never
+/// matched as a flag, a value flag or a positional. Without that, a wrapper
+/// running `ca issue … -cn "$name"` with `name="-ca"` got both `-cn`'s value
+/// *and* the `-ca` flag (a CA certificate for the requester's key), and
+/// `s_client -servername "-insecure"` silently disabled verification.
 pub(crate) struct Args {
     tokens: Vec<String>,
+    /// One entry per token once declared; empty before.
+    kinds: Vec<Kind>,
+    /// The declared value-taking flags.
+    value_flags: Vec<String>,
+    declared: bool,
 }
 
 impl Args {
     pub(crate) fn new(tokens: Vec<String>) -> Self {
-        Args { tokens }
+        Args {
+            tokens,
+            kinds: Vec::new(),
+            value_flags: Vec::new(),
+            declared: false,
+        }
     }
 
     /// Builds a fresh [`Args`] by prepending `prefix` tokens. The shim
     /// binaries `s_dtls_client` / `s_dtls_server` use this to inject
     /// `-dtls1_2` ahead of the user's argv before handing off to the
-    /// shared `s_client` / `s_server` logic.
+    /// shared `s_client` / `s_server` logic. The result is undeclared.
     pub(crate) fn with_prefix(self, prefix: &[&str]) -> Self {
         let mut out: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
         out.extend(self.tokens);
-        Args { tokens: out }
+        Args::new(out)
     }
 
-    /// Iterator over the raw argv tokens (post-subcommand). Used by callers
-    /// that need to collect every occurrence of a repeated flag (e.g.
-    /// `pkeyutl -pkeyopt a:b -pkeyopt c:d` — `value` only returns the first).
-    pub(crate) fn tokens_iter(&self) -> std::slice::Iter<'_, String> {
-        self.tokens.iter()
+    /// Declares the complete set of value-taking flags of the subcommand
+    /// and classifies argv against it. Every subcommand calls this once,
+    /// before any accessor: the accessors refuse to work on an undeclared
+    /// view, and [`value`](Args::value) refuses a flag that is not in the
+    /// set, so a value flag cannot be forgotten here without the command
+    /// failing outright (rather than quietly reopening the injection hole).
+    ///
+    /// Dies when a value-taking flag is the last token: it must not fall
+    /// back to its default (`enc … -out` used to write to stdout).
+    pub(crate) fn declare(self, value_flags: &[&str]) -> Self {
+        match Self::classify(self.tokens, value_flags) {
+            Ok(args) => args,
+            Err(msg) => die(msg),
+        }
+    }
+
+    /// The classification pass behind [`declare`](Args::declare).
+    fn classify(tokens: Vec<String>, value_flags: &[&str]) -> Result<Self, String> {
+        let is_value_flag = |tok: &str| value_flags.iter().any(|f| Self::is_flag(tok, f));
+        let mut kinds = Vec::with_capacity(tokens.len());
+        let mut pending: Option<&str> = None; // a value flag awaiting its value
+        let mut terminated = false;
+        for t in &tokens {
+            let kind = if pending.take().is_some() {
+                Kind::Value
+            } else if terminated {
+                Kind::Positional
+            } else if t == "--" {
+                terminated = true;
+                Kind::Terminator
+            } else if !t.starts_with('-') || t == "-" {
+                Kind::Positional
+            } else if is_value_flag(t) {
+                pending = Some(t);
+                Kind::ValueFlag
+            } else {
+                match t.find('=') {
+                    Some(eq) if is_value_flag(&t[..eq]) => Kind::Inline(eq),
+                    _ => Kind::Flag,
+                }
+            };
+            kinds.push(kind);
+        }
+        if let Some(flag) = pending {
+            return Err(format!("missing value for {flag}"));
+        }
+        Ok(Args {
+            tokens,
+            kinds,
+            value_flags: value_flags.iter().map(|f| f.to_string()).collect(),
+            declared: true,
+        })
     }
 
     /// Whether argv token `tok` names flag `name`, treating the single- and
@@ -122,50 +208,92 @@ impl Args {
                 && !tok.trim_start_matches('-').is_empty())
     }
 
-    /// The value following flag `name` (e.g. `-in file` → `Some("file")`).
-    /// `None` when the flag is absent. A flag given as the very last token
-    /// has no value and is a usage error: it must not fall back to the
-    /// default (`enc … -out` used to write ciphertext to stdout).
-    pub(crate) fn value(&self, name: &str) -> Option<&str> {
-        let i = self.tokens.iter().position(|t| Self::is_flag(t, name))?;
-        match self.tokens.get(i + 1) {
-            Some(v) => Some(v.as_str()),
-            None => die(format!("missing value for {}", self.tokens[i])),
+    /// Whether `name` is one of the declared value-taking flags.
+    fn is_declared_value_flag(&self, name: &str) -> bool {
+        self.value_flags.iter().any(|f| Self::is_flag(name, f))
+    }
+
+    /// The programming errors the accessors refuse, each of which would let
+    /// a flag's value be read as a flag again: an accessor used before
+    /// [`declare`](Args::declare), a `value()` for a flag that was not
+    /// declared value-taking, or a `flag()` for one that was.
+    fn misuse(&self, name: &str, wants_value: bool) -> Option<String> {
+        if !self.declared {
+            return Some(
+                "internal error: arguments queried before the value-taking flags were declared"
+                    .into(),
+            );
+        }
+        if self.is_declared_value_flag(name) != wants_value {
+            return Some(format!(
+                "internal error: {name} is {} declared as a value-taking flag",
+                if wants_value { "not" } else { "also" }
+            ));
+        }
+        None
+    }
+
+    /// Fails closed on a [`misuse`](Args::misuse).
+    fn check(&self, name: &str, wants_value: bool) {
+        if let Some(msg) = self.misuse(name, wants_value) {
+            die(msg);
         }
     }
 
-    /// Whether the boolean flag `name` is present.
+    /// Every value given for flag `name`, in argv order (`-pkeyopt a:b
+    /// -pkeyopt c:d`), in either the `-flag VALUE` or `-flag=VALUE` form.
+    pub(crate) fn values(&self, name: &str) -> Vec<&str> {
+        self.check(name, true);
+        let mut out = Vec::new();
+        for (i, t) in self.tokens.iter().enumerate() {
+            match self.kinds[i] {
+                Kind::ValueFlag if Self::is_flag(t, name) => {
+                    // `classify` guarantees a value token follows.
+                    out.push(self.tokens[i + 1].as_str());
+                }
+                Kind::Inline(eq) if Self::is_flag(&t[..eq], name) => out.push(&t[eq + 1..]),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The value following flag `name` (e.g. `-in file` → `Some("file")`),
+    /// or attached to it (`-in=file`). `None` when the flag is absent; the
+    /// first occurrence wins. The value is taken verbatim even when it looks
+    /// like a flag: `-cn -ca` yields `Some("-ca")` and does *not* set `-ca`.
+    pub(crate) fn value(&self, name: &str) -> Option<&str> {
+        self.values(name).first().copied()
+    }
+
+    /// Whether the boolean flag `name` is present — as a flag, not as some
+    /// other flag's value.
     pub(crate) fn flag(&self, name: &str) -> bool {
-        self.tokens.iter().any(|t| Self::is_flag(t, name))
+        self.last_pos(name).is_some()
     }
 
     /// Returns the position (argv index, post-subcommand) of the last
-    /// occurrence of `name`, if any. Useful for last-wins flag semantics
-    /// (e.g. choosing between `-tls1_2` and `-dtls1_3`).
+    /// occurrence of the boolean flag `name`, if any. Useful for last-wins
+    /// flag semantics (e.g. choosing between `-tls1_2` and `-dtls1_3`).
     pub(crate) fn last_pos(&self, name: &str) -> Option<usize> {
-        self.tokens.iter().rposition(|t| Self::is_flag(t, name))
+        self.check(name, false);
+        (0..self.tokens.len())
+            .rev()
+            .find(|&i| self.kinds[i] == Kind::Flag && Self::is_flag(&self.tokens[i], name))
     }
 
-    /// Positional arguments — tokens that are neither a flag nor the value of a
-    /// value-taking flag in `value_flags`.
-    pub(crate) fn positionals(&self, value_flags: &[&str]) -> Vec<&str> {
-        let mut out = Vec::new();
-        let mut skip = false;
-        for t in &self.tokens {
-            if skip {
-                skip = false;
-                continue;
-            }
-            if value_flags.iter().any(|f| Self::is_flag(t, f)) {
-                skip = true; // consume this flag's value
-                continue;
-            }
-            if t.starts_with('-') && t.as_str() != "-" {
-                continue; // a boolean flag
-            }
-            out.push(t.as_str());
+    /// Positional arguments — tokens that are neither a flag nor a flag's
+    /// value, plus everything after a `--` terminator.
+    pub(crate) fn positionals(&self) -> Vec<&str> {
+        if !self.declared {
+            die("internal error: arguments queried before the value-taking flags were declared");
         }
-        out
+        self.tokens
+            .iter()
+            .zip(&self.kinds)
+            .filter(|(_, k)| **k == Kind::Positional)
+            .map(|(t, _)| t.as_str())
+            .collect()
     }
 }
 
@@ -947,4 +1075,131 @@ pub(crate) fn parse_group(name: &str, flag: &str) -> purecrypto::tls::NamedGroup
             known.join(", ")
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(tokens: &[&str], value_flags: &[&str]) -> Args {
+        Args::classify(tokens.iter().map(|s| s.to_string()).collect(), value_flags)
+            .unwrap_or_else(|e| panic!("classify failed: {e}"))
+    }
+
+    /// A token in a value position is that flag's value and nothing else:
+    /// `-cn -ca` must not also set `-ca`, and `-servername -insecure` must
+    /// not also disable verification.
+    #[test]
+    fn a_flags_value_is_never_matched_as_a_flag() {
+        let a = args(
+            &["-dir", "CA", "-pubkey", "k.pub", "-cn", "-ca"],
+            &["-dir", "-pubkey", "-cn"],
+        );
+        assert_eq!(a.value("-cn"), Some("-ca"));
+        assert!(!a.flag("-ca") && !a.flag("--ca"));
+        assert_eq!(a.last_pos("-ca"), None);
+        assert!(a.positionals().is_empty());
+
+        let a = args(
+            &["-connect", "h:443", "-servername", "-insecure"],
+            &["-connect", "-servername", "-alpn"],
+        );
+        assert_eq!(a.value("-servername"), Some("-insecure"));
+        assert!(!a.flag("-insecure") && !a.flag("--insecure"));
+        let a = args(
+            &["-connect", "h:443", "-alpn", "--insecure"],
+            &["-connect", "-servername", "-alpn"],
+        );
+        assert_eq!(a.value("-alpn"), Some("--insecure"));
+        assert!(!a.flag("-insecure"));
+        // …while the flag proper still works, in either spelling.
+        let a = args(
+            &["-connect", "h:443", "--insecure"],
+            &["-connect", "-servername", "-alpn"],
+        );
+        assert!(a.flag("-insecure"));
+        assert_eq!(a.last_pos("-insecure"), Some(2));
+    }
+
+    /// A value that spells another value flag is still a value: it does not
+    /// start a second flag and steal the following token.
+    #[test]
+    fn a_flags_value_is_never_matched_as_a_value_flag() {
+        let a = args(&["-cn", "-out", "-out", "x.pem"], &["-cn", "-out"]);
+        assert_eq!(a.value("-cn"), Some("-out"));
+        assert_eq!(a.value("-out"), Some("x.pem"));
+        // The protocol picker must not see a version flag in a value.
+        let a = args(&["-dtls1_2", "-servername", "-quic"], &["-servername"]);
+        assert_eq!(a.last_pos("-quic"), None);
+        assert_eq!(a.last_pos("-dtls1_2"), Some(0));
+    }
+
+    #[test]
+    fn positionals_skip_flags_and_values() {
+        let a = args(&["sha256", "-out", "o", "-binary", "file", "-"], &["-out"]);
+        assert_eq!(a.positionals(), ["sha256", "file", "-"]);
+        assert!(a.flag("--binary"));
+        assert_eq!(a.value("--out"), Some("o"));
+    }
+
+    #[test]
+    fn double_dash_ends_the_options() {
+        let a = args(&["-binary", "--", "-out", "-x"], &["-out"]);
+        assert!(a.flag("-binary"));
+        assert_eq!(a.value("-out"), None);
+        assert!(!a.flag("-x"));
+        assert_eq!(a.positionals(), ["-out", "-x"]);
+        // As a value, `--` is just a value.
+        let a = args(&["-cn", "--", "-ca"], &["-cn"]);
+        assert_eq!(a.value("-cn"), Some("--"));
+        assert!(a.flag("-ca"));
+    }
+
+    #[test]
+    fn attached_values() {
+        let a = args(
+            &[
+                "-cn=-ca",
+                "--out=a=b",
+                "-text=1",
+                "-pkeyopt",
+                "x:1",
+                "-pkeyopt=y:2",
+            ],
+            &["-cn", "-out", "-pkeyopt"],
+        );
+        assert_eq!(a.value("-cn"), Some("-ca"));
+        assert_eq!(a.value("-out"), Some("a=b"));
+        assert_eq!(a.values("-pkeyopt"), ["x:1", "y:2"]);
+        assert!(!a.flag("-ca"));
+        // `-text` takes no value, so `-text=1` is some unknown flag, not it.
+        assert!(!a.flag("-text"));
+        assert!(a.positionals().is_empty());
+    }
+
+    #[test]
+    fn missing_value_is_an_error() {
+        let r = Args::classify(vec!["4".into(), "--out".into()], &["-out"]);
+        assert_eq!(r.err().as_deref(), Some("missing value for --out"));
+    }
+
+    /// The accessors refuse an undeclared view and a flag asked for in the
+    /// wrong role, so a subcommand cannot forget to declare a value flag.
+    #[test]
+    fn undeclared_use_is_refused() {
+        let raw = Args::new(vec!["-cn".into(), "x".into()]);
+        assert!(raw.misuse("-cn", true).is_some());
+        assert!(raw.misuse("-ca", false).is_some());
+        let a = args(&["-cn", "x"], &["-cn"]);
+        assert!(a.misuse("-cn", true).is_none());
+        assert!(a.misuse("--cn", true).is_none());
+        assert!(a.misuse("-ca", false).is_none());
+        assert!(
+            a.misuse("-subj", true).is_some(),
+            "value() of an undeclared flag"
+        );
+        assert!(a.misuse("-cn", false).is_some(), "flag() of a value flag");
+        // `with_prefix` hands back an undeclared view.
+        assert!(a.with_prefix(&["-quic"]).misuse("-quic", false).is_some());
+    }
 }

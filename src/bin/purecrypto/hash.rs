@@ -61,7 +61,8 @@ fn xof(alg: &str, data: &[u8], len: usize, custom: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn run(args: Args) {
-    let pos = args.positionals(&["-out", "-len", "--len", "-custom", "--custom"]);
+    let args = args.declare(&["-out", "-len", "-custom"]);
+    let pos = args.positionals();
     let Some(&alg) = pos.first() else {
         die("usage: purecrypto hash <algorithm> [file]  (file defaults to stdin)");
     };

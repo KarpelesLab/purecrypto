@@ -277,6 +277,18 @@ fn hex_digit(n: u8) -> char {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&[
+        "-days",
+        "-set_serial",
+        "-addext",
+        "-san",
+        "-in",
+        "-CA",
+        "-CAkey",
+        "-subj",
+        "-out",
+        "-key",
+    ]);
     let is_ca = args.flag("--ca") || args.flag("-ca");
 
     // CA-sign a CSR: -req -in csr -CA cert -CAkey key.

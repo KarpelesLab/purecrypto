@@ -427,55 +427,33 @@ Output is hex unless `-binary` is set, written to `-out` (default stdout).
 overwritten, and writing raw bytes to a terminal is refused (use `-out -`).";
 
 pub(crate) fn run(args: Args) {
-    // First positional after `kdf` selects the algorithm subcommand.
-    let pos = args.positionals(&[
+    let args = args.declare(&[
         "-hash",
-        "--hash",
         "-salt",
-        "--salt",
         "-ikm",
-        "--ikm",
         "-ikmfile",
-        "--ikmfile",
         "-info",
-        "--info",
         "-password",
-        "--password",
         "-password-file",
-        "--password-file",
         "-iter",
-        "--iter",
         "-n",
-        "--n",
         "-r",
-        "--r",
         "-p",
-        "--p",
         "-len",
-        "--len",
         "-variant",
-        "--variant",
         "-t-cost",
-        "--t-cost",
         "-m-cost",
-        "--m-cost",
         "-mode",
-        "--mode",
         "-prf",
-        "--prf",
         "-ki",
-        "--ki",
         "-kifile",
-        "--kifile",
         "-label",
-        "--label",
         "-context",
-        "--context",
         "-iv",
-        "--iv",
         "-out",
-        "--out",
     ]);
+    // First positional after `kdf` selects the algorithm subcommand.
+    let pos = args.positionals();
     let sub = pos.first().copied().unwrap_or("");
     crate::util::reject_extra_positionals(&pos, 1);
     match sub {

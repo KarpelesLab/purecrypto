@@ -115,6 +115,35 @@ fn load_signing_key(key_path: &str) -> SigningKey {
 }
 
 pub(crate) fn run(args: Args) {
+    // Every value-taking flag of the TLS/DTLS driver *and* of the QUIC one:
+    // argv must be classified before `-quic` (a flag, never some other
+    // flag's value) can pick the driver.
+    let mut value_flags = vec![
+        "-cert",
+        "-key",
+        "-accept",
+        "-Verify",
+        "-alpn",
+        "-keylogfile",
+        "-mtu",
+        "-groups",
+        "-prefer-group",
+        "-ciphersuites",
+        "-max_early_data",
+        "-min_protocol",
+        "-naccept",
+        "-rpk_peer_key",
+        "-status_file",
+        "-record_size_limit",
+        "-cid",
+        "-cid_len",
+        "-cert_comp",
+        "-cert_comp_own",
+    ];
+    value_flags.extend(crate::ech::SERVER_VALUE_FLAGS);
+    value_flags.extend(tlsinfo::PSK_VALUE_FLAGS);
+    value_flags.extend(crate::quic_cli::SERVER_VALUE_FLAGS);
+    let args = args.declare(&value_flags);
     // -quic dispatches to the QUIC-specific UDP driver. Right-most
     // wins between -quic / -tls1_* / -dtls1_*.
     if has_latest_quic(&args) {

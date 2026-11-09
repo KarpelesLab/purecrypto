@@ -9,7 +9,8 @@ use purecrypto::rng::{OsRng, RngCore};
 const MAX_RAND_BYTES: usize = 1 << 30;
 
 pub(crate) fn run(args: Args) {
-    let pos = args.positionals(&["-out"]);
+    let args = args.declare(&["-out"]);
+    let pos = args.positionals();
     let Some(&n) = pos.first() else {
         die("usage: purecrypto rand <nbytes> [--binary] [-out file]");
     };

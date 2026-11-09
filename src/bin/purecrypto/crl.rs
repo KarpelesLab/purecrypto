@@ -108,6 +108,7 @@ fn is_revoked(crl: &CertificateRevocationList, serial_arg: &str) {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&["-in", "-CAfile", "-cafile", "-serial"]);
     let in_path = args.value("-in").or_else(|| args.value("--in"));
     let crl = load_crl(in_path);
     if args.flag("-text") || args.flag("--text") {

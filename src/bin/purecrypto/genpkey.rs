@@ -183,6 +183,7 @@ fn stateful_key_bytes(algorithm: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&["-algorithm", "-out", "-bits", "-curve"]);
     let algorithm = args
         .value("-algorithm")
         .or_else(|| args.value("--algorithm"))

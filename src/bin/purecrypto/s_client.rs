@@ -174,15 +174,9 @@ fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, Signi
 }
 
 pub(crate) fn run(args: Args) {
-    // -quic dispatches to the QUIC-specific UDP driver. We treat -quic
-    // as the highest-priority protocol flag — if any other version flag
-    // appears later on the command line it takes precedence (right-most
-    // wins), so `q_client -tls1_3 ...` still demotes to TLS-over-TCP.
-    if has_latest_quic(&args) {
-        crate::quic_cli::run_client(args);
-        return;
-    }
-    let version = resolve_version(&args);
+    // Every value-taking flag of the TLS/DTLS driver *and* of the QUIC one:
+    // argv must be classified before `-quic` (a flag, never some other
+    // flag's value) can pick the driver.
     let mut value_flags = vec![
         "-connect",
         "-servername",
@@ -208,9 +202,20 @@ pub(crate) fn run(args: Args) {
     ];
     value_flags.extend(crate::ech::CLIENT_VALUE_FLAGS);
     value_flags.extend(tlsinfo::PSK_VALUE_FLAGS);
+    value_flags.extend(crate::quic_cli::CLIENT_VALUE_FLAGS);
+    let args = args.declare(&value_flags);
+    // -quic dispatches to the QUIC-specific UDP driver. We treat -quic
+    // as the highest-priority protocol flag — if any other version flag
+    // appears later on the command line it takes precedence (right-most
+    // wins), so `q_client -tls1_3 ...` still demotes to TLS-over-TCP.
+    if has_latest_quic(&args) {
+        crate::quic_cli::run_client(args);
+        return;
+    }
+    let version = resolve_version(&args);
     let connect = args
         .value("-connect")
-        .or_else(|| args.positionals(&value_flags).first().copied())
+        .or_else(|| args.positionals().first().copied())
         .unwrap_or_else(|| {
             die(
                 "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-min_protocol TLSv1.2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-key-shares x25519,...] [-groups x25519:secp256r1] [-ciphersuites TLS_AES_128_GCM_SHA256:...] [-reconnect [-early_data FILE]] [-key_update] [-enable_server_rpk -rpk_peer_key pub.pem] [-enable_client_rpk] [-record_size_limit N] [-no_cert_comp | -cert_comp LIST [-cert_comp_own LIST]] [-read_timeout SECS] [-resend N] [-cid HEX | -cid_len N] [-rebind] [-keylogfile keys.log] [-ech-config-list list.bin [-ech-retry-configs-out FILE] | -ech-grease] [-psk_modes psk_dhe_ke:psk_ke] [-psk_identity NAME (-psk HEX | -psk_file FILE) [-psk_hash sha384] [-psk_import [-psk_context STR]]]",

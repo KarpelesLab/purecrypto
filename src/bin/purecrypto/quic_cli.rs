@@ -564,29 +564,53 @@ impl ClientSetup<'_> {
     }
 }
 
+/// The `q_client` (`s_client -quic`) flags that take a value. `s_client`
+/// declares them together with its own before dispatching here: which
+/// driver runs depends on where `-quic` sits among the *flags*, so argv has
+/// to be classified before that is known.
+pub(crate) const CLIENT_VALUE_FLAGS: [&str; 17] = [
+    "-connect",
+    "-servername",
+    "-CAfile",
+    "-alpn",
+    "-keylogfile",
+    "-mtu",
+    "-ciphersuites",
+    "-groups",
+    "-key-shares",
+    "-close-code",
+    "-close-reason",
+    "-idle-timeout",
+    "-linger",
+    "-exchanges",
+    "-pause",
+    "-timeout",
+    "-quic_versions",
+];
+
+/// The `q_server` (`s_server -quic`) flags that take a value; see
+/// [`CLIENT_VALUE_FLAGS`].
+pub(crate) const SERVER_VALUE_FLAGS: [&str; 13] = [
+    "-cert",
+    "-key",
+    "-accept",
+    "-alpn",
+    "-keylogfile",
+    "-ciphersuites",
+    "-groups",
+    "-idle-timeout",
+    "-quic_versions",
+    "-naccept",
+    "-timeout",
+    "-reset-key",
+    "-reset-key-file",
+];
+
+/// Runs the QUIC client. `args` arrives already declared by `s_client::run`.
 pub(crate) fn run_client(args: Args) {
-    let value_flags = [
-        "-connect",
-        "-servername",
-        "-CAfile",
-        "-alpn",
-        "-keylogfile",
-        "-mtu",
-        "-ciphersuites",
-        "-groups",
-        "-key-shares",
-        "-close-code",
-        "-close-reason",
-        "-idle-timeout",
-        "-linger",
-        "-exchanges",
-        "-pause",
-        "-timeout",
-        "-quic_versions",
-    ];
     let connect = args
         .value("-connect")
-        .or_else(|| args.positionals(&value_flags).first().copied())
+        .or_else(|| args.positionals().first().copied())
         .unwrap_or_else(|| {
             die(
                 "usage: purecrypto q_client -connect host:port -alpn proto [-insecure] \
@@ -925,6 +949,7 @@ pub(crate) fn run_client(args: Args) {
 // Server
 // ====================================================================
 
+/// Runs the QUIC server. `args` arrives already declared by `s_server::run`.
 pub(crate) fn run_server(args: Args) {
     let cert_path = args.value("-cert").unwrap_or_else(|| {
         die(

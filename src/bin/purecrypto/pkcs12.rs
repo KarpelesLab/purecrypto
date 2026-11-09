@@ -245,6 +245,15 @@ fn unpack(args: &Args) {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&[
+        "-inkey",
+        "-in",
+        "-out",
+        "-passout",
+        "-certfile",
+        "-name",
+        "-passin",
+    ]);
     if args.flag("-h") || args.flag("--help") {
         println!("{USAGE}");
         return;

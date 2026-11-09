@@ -81,6 +81,7 @@ fn parse_pkcs8(pem: &str) -> Option<Key> {
 }
 
 pub(crate) fn run(args: Args) {
+    let args = args.declare(&["-in", "-out"]);
     let in_path = args.value("-in").or_else(|| args.value("--in"));
     // `-in` is private-key material: warn if the file is group/world-
     // readable, matching the other secret-key readers. Only a real file

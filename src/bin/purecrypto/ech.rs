@@ -23,6 +23,9 @@ use purecrypto::tls::ConfigBuilder;
 /// The value-taking ECH flags of `s_client`, for positional parsing.
 pub(crate) const CLIENT_VALUE_FLAGS: [&str; 2] = ["-ech-config-list", "-ech-retry-configs-out"];
 
+/// The `s_server` ECH flags that take a value.
+pub(crate) const SERVER_VALUE_FLAGS: [&str; 2] = ["-ech-key", "-ech-config"];
+
 /// Where the `s_client` ECH options ended up: what to report after the
 /// handshake and where to save a rejection's `retry_configs`.
 #[derive(Default, Clone)]
@@ -207,6 +210,14 @@ pub(crate) fn report_server(conn: &purecrypto::tls::Connection, configured: bool
 /// `purecrypto generate-ech` — create an ECH key pair and its `ECHConfig`,
 /// written in the formats `bssl generate-ech` uses.
 pub(crate) fn run_generate(args: Args) {
+    let args = args.declare(&[
+        "-public-name",
+        "-out-ech-config-list",
+        "-out-ech-config",
+        "-out-private-key",
+        "-config-id",
+        "-max-name-length",
+    ]);
     const USAGE: &str = "usage: purecrypto generate-ech -public-name NAME \
         -out-ech-config-list FILE -out-ech-config FILE -out-private-key FILE \
         [-config-id N] [-max-name-length N]";
@@ -218,17 +229,7 @@ pub(crate) fn run_generate(args: Args) {
     let out_key = args.value("-out-private-key").unwrap_or_else(|| die(USAGE));
     let config_id = parse_u8(args.value("-config-id"), "-config-id");
     let max_name_length = parse_u8(args.value("-max-name-length"), "-max-name-length");
-    crate::util::reject_extra_positionals(
-        &args.positionals(&[
-            "-public-name",
-            "-out-ech-config-list",
-            "-out-ech-config",
-            "-out-private-key",
-            "-config-id",
-            "-max-name-length",
-        ]),
-        0,
-    );
+    crate::util::reject_extra_positionals(&args.positionals(), 0);
     #[cfg(not(feature = "ech"))]
     {
         let _ = (
