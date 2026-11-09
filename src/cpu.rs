@@ -13,8 +13,24 @@
 //!   read with `XGETBV`. The SSE-class extensions (SHA-NI, AES-NI, PCLMULQDQ,
 //!   SSSE3, SSE4.1) use only the XMM registers. A target whose ABI does not
 //!   itself use SSE (`target_feature = "sse2"` off, e.g. a soft-float kernel
-//!   target, which may run with the FPU disabled) reports nothing at all.
-//!   This matches what `std::is_x86_feature_detected!` answers.
+//!   target, which may run with the FPU disabled) reports nothing at all,
+//!   and so does an SGX enclave target (`target_env = "sgx"`): `CPUID` and
+//!   `XGETBV` raise #UD inside an enclave, so they are never executed there
+//!   and every backend takes its portable path. On Intel, BMI1/BMI2 are
+//!   reported only alongside usable AVX (see `detect`). In all of this the
+//!   run-time answer is meant to match `std::is_x86_feature_detected!`,
+//!   feature for feature (a test pins it on the host); unlike that macro,
+//!   the probes are not short-circuited by compile-time `target_feature`s.
+//!
+//!   An enclave built with an SDK that keeps an ordinary target triple (for
+//!   example `x86_64-unknown-linux-gnu` under an SGX SDK, rather than
+//!   `x86_64-fortanix-unknown-sgx`) is *not* recognised: the crate cannot
+//!   tell it is inside an enclave and will execute `CPUID` on the first
+//!   query. The crate currently has no supported build- or run-time switch
+//!   that forces the portable kernels (the `__ct-check` feature's
+//!   `PURECRYPTO_CT_FORCE_PORTABLE` is internal to the constant-time test
+//!   harness and is consulted per backend, not by this module), so such
+//!   an environment must emulate or trap-and-handle `CPUID`/`XGETBV`.
 //! - **aarch64**: with `std`, `std::arch::is_aarch64_feature_detected!` (it
 //!   asks the OS, e.g. `getauxval(AT_HWCAP)` on Linux). Without `std` there is
 //!   no portable way to ask — `ID_AA64ISAR0_EL1` is not readable from EL0 on
@@ -83,12 +99,19 @@ mod x86 {
     fn detect() -> u32 {
         use core::arch::x86_64::{__cpuid, __cpuid_count};
 
-        if !cfg!(target_feature = "sse2") {
+        // No SSE in the target ABI: report nothing (see the module docs).
+        // Inside an SGX enclave `CPUID` (and `XGETBV`) raise #UD, so it must
+        // not be executed at all; `std`'s detection likewise reports an empty
+        // feature set on `target_env = "sgx"`.
+        if !cfg!(target_feature = "sse2") || cfg!(target_env = "sgx") {
             return 0;
         }
         // SAFETY: `CPUID` exists on every x86_64 CPU (newer toolchains make
         // these intrinsics safe, hence `unused_unsafe`).
-        let max_leaf = unsafe { __cpuid(0) }.eax;
+        let l0 = unsafe { __cpuid(0) };
+        let max_leaf = l0.eax;
+        // "GenuineIntel" in EBX, EDX, ECX.
+        let intel = (l0.ebx, l0.edx, l0.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
         let l1 = unsafe { __cpuid(1) };
         let (ebx7, ecx7, max7) = if max_leaf >= 7 {
             // SAFETY: as above; leaf 7 is in range.
@@ -128,10 +151,13 @@ mod x86 {
         // The wide-register extensions also need the OS to save that state.
         let osxsave = bit(l1.ecx, 27);
         let avx = bit(l1.ecx, 28);
+        // AVX itself usable: the CPU has it and the OS saves YMM state.
+        let mut avx_usable = false;
         if osxsave && avx && max7 {
             // SAFETY: `OSXSAVE` was just checked.
             let xcr0 = unsafe { xcr0() };
             let ymm = xcr0 & 0b110 == 0b110; // SSE + AVX state
+            avx_usable = ymm;
             let zmm = xcr0 & 0b1110_0000 == 0b1110_0000; // opmask + ZMM_Hi256 + Hi16_ZMM
             if ymm && bit(ebx7, 5) {
                 f |= AVX2;
@@ -156,6 +182,15 @@ mod x86 {
                     f |= AVX512IFMA;
                 }
             }
+        }
+        // Some Skylake-generation Pentium/Celeron parts report BMI1/BMI2 in
+        // `CPUID` without implementing them (Intel erratum SKL052); those
+        // parts have no AVX, and every Intel CPU with real BMI has AVX. As
+        // `std` does, on Intel report BMI only alongside usable AVX, so a
+        // BMI-only caller cannot fault there. (The BMI bits come from leaf
+        // 7, so `max7` gating `avx_usable` loses nothing.)
+        if intel && !avx_usable {
+            f &= !(BMI1 | BMI2);
         }
         f
     }
