@@ -47,11 +47,17 @@ fn pinned() -> &'static Pinned {
     PINNED.get_or_init(|| {
         let i_id = [0xa5u8; 16];
         let seed = [0x5au8; 32];
-        let lms = LmsPrivateKey::from_seed(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &i_id, &seed);
+        let lms =
+            LmsPrivateKey::from_seed(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &i_id, &seed);
         // Two-level HSS so the multi-level signature walk is reachable.
         let hss = HssPrivateKey::from_levels(&[
             (LmsType::Sha256M32H5, LmotsType::Sha256N32W8, i_id, seed),
-            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8, [0x3cu8; 16], [0xc3u8; 32]),
+            (
+                LmsType::Sha256M32H5,
+                LmotsType::Sha256N32W8,
+                [0x3cu8; 16],
+                [0xc3u8; 32],
+            ),
         ])
         .unwrap();
         Pinned {

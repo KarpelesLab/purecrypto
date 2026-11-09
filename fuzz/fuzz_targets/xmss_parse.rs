@@ -14,8 +14,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use purecrypto::xmss::{
-    XmssMtParamSet, XmssMtPrivateKey, XmssMtPublicKey, XmssParamSet, XmssPrivateKey,
-    XmssPublicKey,
+    XmssMtParamSet, XmssMtPrivateKey, XmssMtPublicKey, XmssParamSet, XmssPrivateKey, XmssPublicKey,
 };
 use std::sync::OnceLock;
 

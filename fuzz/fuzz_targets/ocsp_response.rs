@@ -19,8 +19,8 @@ use purecrypto::hash::Sha256;
 use purecrypto::rng::HmacDrbg;
 use purecrypto::signature_registry::SignaturePolicy;
 use purecrypto::x509::{
-    AnyPublicKey, CertSigner, Certificate, DistinguishedName, OcspCheckOptions, OcspResponse,
-    Time, Validity,
+    AnyPublicKey, CertSigner, Certificate, DistinguishedName, OcspCheckOptions, OcspResponse, Time,
+    Validity,
 };
 use std::sync::OnceLock;
 
