@@ -497,3 +497,320 @@ fn input_after_close_notify_is_ignored() {
         "no fatal alert after a clean close"
     );
 }
+
+// ---- Staging of the renegotiated session (nothing unproven is exposed) ----
+
+/// A P-256 self-signed client identity named `cn` from `seed`.
+fn client_identity(seed: &[u8], cn: &str) -> (Vec<u8>, BoxedEcdsaPrivateKey) {
+    let mut rng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let der = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name(cn),
+        &Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        ),
+        1,
+        false,
+        &[cn],
+    )
+    .unwrap()
+    .to_der()
+    .to_vec();
+    (der, key)
+}
+
+/// A server config that asks for (but does not require) a client
+/// certificate chaining to `client_root`, speaking ALPN `h2`.
+fn optional_client_auth_server(client_root: &[u8]) -> (ServerConfig12, Vec<u8>) {
+    let (cfg, der) = ecdsa_server12(b"reneg-server-key-a");
+    let mut cfg = cfg
+        .with_client_auth(roots(client_root), false)
+        .with_alpn(alloc::vec![b"h2".to_vec()])
+        .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0));
+    cfg.renegotiation = enabled();
+    (cfg, der)
+}
+
+/// A renegotiation-enabled client speaking ALPN `h2`, with an optional
+/// client identity.
+fn alpn_client(
+    trust: RootCertStore,
+    policy: RenegotiationPolicy,
+    identity: Option<(Vec<u8>, BoxedEcdsaPrivateKey)>,
+    label: &[u8],
+) -> ClientConnection12 {
+    let mut cfg: ClientConfig12 = client_config12(trust).with_alpn(alloc::vec![b"h2".to_vec()]);
+    if let Some((der, key)) = identity {
+        cfg = cfg.with_client_cert(crate::tls::ClientCertConfig::with_ecdsa(
+            alloc::vec![der],
+            key,
+        ));
+    }
+    cfg.renegotiation = policy;
+    let mut rng = HmacDrbg::<Sha256>::new(label, b"nonce", &[]);
+    ClientConnection12::new_with_offer(
+        cfg,
+        "loopback.example",
+        &mut rng,
+        &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+        &[NamedGroup::X25519],
+    )
+}
+
+/// Splits a TLS byte stream into its records (header included).
+fn split_records(mut wire: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while wire.len() >= 5 {
+        let len = 5 + usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        out.push(wire[..len].to_vec());
+        wire = &wire[len..];
+    }
+    assert!(wire.is_empty(), "trailing partial record");
+    out
+}
+
+/// Everything the server reports about its session.
+#[derive(Debug, PartialEq, Eq)]
+struct ServerView {
+    certs: Vec<Vec<u8>>,
+    sig_scheme: Option<u16>,
+    suite: Option<u16>,
+    group: Option<NamedGroup>,
+    alpn: Option<Vec<u8>>,
+    sni: Option<alloc::string::String>,
+    master: Option<[u8; 48]>,
+    exporter: [u8; 32],
+    ems: bool,
+    resumed: bool,
+}
+
+fn server_view(s: &Server) -> ServerView {
+    let mut exporter = [0u8; 32];
+    s.tls_exporter(b"EXPORTER-reneg-test", None, &mut exporter)
+        .unwrap();
+    ServerView {
+        certs: s.peer_certificates().to_vec(),
+        sig_scheme: s.peer_signature_scheme(),
+        suite: s.negotiated_cipher_suite(),
+        group: s.negotiated_group(),
+        alpn: s.alpn_protocol().map(<[u8]>::to_vec),
+        sni: s.peer_server_name().map(alloc::string::String::from),
+        master: s.master_secret(),
+        exporter,
+        ems: s.ems_negotiated(),
+        resumed: s.did_resume(),
+    }
+}
+
+/// Everything the client reports about its session.
+#[derive(Debug, PartialEq, Eq)]
+struct ClientView {
+    certs: Vec<Vec<u8>>,
+    sig_scheme: Option<u16>,
+    suite: Option<u16>,
+    group: Option<NamedGroup>,
+    alpn: Option<Vec<u8>>,
+    client_random: [u8; 32],
+    master: Option<[u8; 48]>,
+    exporter: [u8; 32],
+    ems: bool,
+    resumed: bool,
+}
+
+fn client_view(c: &ClientConnection12) -> ClientView {
+    let mut exporter = [0u8; 32];
+    c.tls_exporter(b"EXPORTER-reneg-test", None, &mut exporter)
+        .unwrap();
+    ClientView {
+        certs: c.peer_certificates().to_vec(),
+        sig_scheme: c.peer_signature_scheme(),
+        suite: c.negotiated_cipher_suite(),
+        group: c.negotiated_group(),
+        alpn: c.alpn_protocol().map(<[u8]>::to_vec),
+        client_random: c.client_random(),
+        master: c.master_secret(),
+        exporter,
+        ems: c.ems_negotiated(),
+        resumed: c.did_resume(),
+    }
+}
+
+/// A forged 12-byte `Finished` handshake message.
+fn forged_finished() -> Vec<u8> {
+    let mut forged = alloc::vec![20u8, 0, 0, 12];
+    forged.extend_from_slice(&[0u8; 12]);
+    forged
+}
+
+/// The attack the staging exists for: an anonymous client starts a
+/// renegotiation, sends a `Certificate` carrying somebody else's (public)
+/// chain, never proves possession of its key, and keeps sending
+/// application data under the old keys. The server must keep describing
+/// the anonymous session it actually authenticated — `peer_certificates()`
+/// empty, exporter and every other accessor unchanged — when that data is
+/// delivered, and after the renegotiation is torn down.
+#[test]
+fn unproven_client_certificate_is_not_exposed_mid_renegotiation() {
+    let (victim_der, _victim_key) = client_identity(b"reneg-victim", "victim");
+    let (cfg, der) = optional_client_auth_server(&victim_der);
+    let mut server = server_with(cfg, enabled(), b"reneg-f1-s");
+    let mut client = alpn_client(roots(&der), enabled(), None, b"reneg-f1-c");
+    pump_ok(&mut client, &mut server);
+    assert!(server.is_handshake_complete());
+    let before = server_view(&server);
+    assert!(before.certs.is_empty(), "the client is anonymous");
+    assert_eq!(before.alpn.as_deref(), Some(&b"h2"[..]));
+    assert_eq!(before.sni.as_deref(), Some("loopback.example"));
+
+    // The renegotiating ClientHello; the server answers with its flight
+    // (CertificateRequest included), which the attacker ignores.
+    client.renegotiate().unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    assert!(server.is_renegotiating());
+    let _ = server.write_tls();
+    assert_eq!(server_view(&server), before, "nothing changes at the hello");
+
+    // Certificate(victim), then a request under the old keys.
+    let mut entries = Vec::new();
+    entries.extend_from_slice(&(victim_der.len() as u32).to_be_bytes()[1..]);
+    entries.extend_from_slice(&victim_der);
+    let mut msg = alloc::vec![11u8];
+    msg.extend_from_slice(&(entries.len() as u32 + 3).to_be_bytes()[1..]);
+    msg.extend_from_slice(&(entries.len() as u32).to_be_bytes()[1..]);
+    msg.extend_from_slice(&entries);
+    client
+        .test_emit_encrypted(ContentType::Handshake, &msg)
+        .unwrap();
+    client
+        .test_emit_encrypted(ContentType::ApplicationData, b"GET /admin")
+        .unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    assert!(server.is_renegotiating());
+    assert_eq!(server.take_received_plaintext(), b"GET /admin");
+    assert!(
+        server.peer_certificates().is_empty(),
+        "a certificate the client has not proven possession of"
+    );
+    assert_eq!(server_view(&server), before);
+
+    // The renegotiation dies (the client's next message is not the
+    // ClientKeyExchange): the anonymous session is still what is reported.
+    client
+        .test_emit_encrypted(ContentType::Handshake, &forged_finished())
+        .unwrap();
+    server.read_tls(&client.write_tls());
+    assert!(server.process_new_packets().is_err());
+    assert_eq!(server_view(&server), before);
+}
+
+/// "Certificate on demand": the client authenticates on the renegotiation.
+/// The new session — the certificate, the master secret, the exporter —
+/// becomes visible on the server only once the client's Finished has
+/// verified; not when the Certificate arrives, nor after the
+/// CertificateVerify and the ChangeCipherSpec.
+#[test]
+fn server_commits_the_renegotiated_session_at_the_client_finished() {
+    let (client_der, client_key) = client_identity(b"reneg-ondemand", "client");
+    // The first handshake does not ask for a certificate.
+    let (cfg, der) = ecdsa_server12(b"reneg-server-key-a");
+    let cfg = cfg.with_alpn(alloc::vec![b"h2".to_vec()]);
+    let mut server = server_with(cfg, enabled(), b"reneg-f1b-s");
+    let mut client = alpn_client(
+        roots(&der),
+        enabled(),
+        Some((client_der.clone(), client_key)),
+        b"reneg-f1b-c",
+    );
+    pump_ok(&mut client, &mut server);
+    let before = server_view(&server);
+    assert!(before.certs.is_empty());
+
+    // The renegotiation does.
+    server.test_replace_config(optional_client_auth_server(&client_der).0);
+    client.renegotiate().unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    client.read_tls(&server.write_tls());
+    client.process_new_packets().unwrap();
+    // Certificate, ClientKeyExchange, CertificateVerify, CCS, Finished.
+    let flight = split_records(&client.write_tls());
+    assert_eq!(flight.len(), 5);
+    for record in &flight[..4] {
+        server.read_tls(record);
+        server.process_new_packets().unwrap();
+        assert!(server.is_renegotiating());
+        assert_eq!(server_view(&server), before);
+    }
+    server.read_tls(&flight[4]);
+    server.process_new_packets().unwrap();
+    assert!(!server.is_renegotiating());
+    let after = server_view(&server);
+    assert_eq!(after.certs, alloc::vec![client_der]);
+    assert!(after.sig_scheme.is_some());
+    assert_ne!(after.master, before.master);
+    assert_ne!(after.exporter, before.exporter);
+    assert_eq!(after.alpn, before.alpn);
+    assert_eq!(after.sni, before.sni);
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.master_secret(), after.master);
+}
+
+/// The client mirror: until the server's Finished verifies, the client
+/// keeps reporting the session being replaced — the old certificate, master
+/// secret, randoms and exporter — and reports the new one afterwards. A
+/// renegotiation that fails leaves the old session's values in place.
+#[test]
+fn client_commits_the_renegotiated_session_at_the_server_finished() {
+    let (_, der_a) = ecdsa_server12(b"reneg-server-key-a");
+    let (_, der_b) = ecdsa_server12(b"reneg-server-key-b");
+    let mut trust = roots(&der_a);
+    trust.add_der(der_b.clone()).unwrap();
+    let policy = enabled().with_peer_certificate_change(true);
+
+    for complete in [true, false] {
+        let (cfg_a, _) = ecdsa_server12(b"reneg-server-key-a");
+        let mut server = server_with(cfg_a, enabled(), b"reneg-f1c-s");
+        let mut client = alpn_client(trust.clone_store(), policy.clone(), None, b"reneg-f1c-c");
+        pump_ok(&mut client, &mut server);
+        let before = client_view(&client);
+        assert_eq!(before.certs, alloc::vec![der_a.clone()]);
+
+        let (mut next, _) = ecdsa_server12(b"reneg-server-key-b");
+        next.renegotiation = enabled();
+        server.test_replace_config(next);
+        client.renegotiate().unwrap();
+        assert_eq!(client_view(&client), before);
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        // ServerHello .. ServerHelloDone, with the other certificate: the
+        // client answers with its own flight and waits for the Finished.
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        assert!(client.is_renegotiating());
+        assert_eq!(client_view(&client), before);
+
+        if complete {
+            pump_ok(&mut client, &mut server);
+            assert!(!client.is_renegotiating());
+            let after = client_view(&client);
+            assert_eq!(after.certs, alloc::vec![der_b.clone()]);
+            assert_ne!(after.master, before.master);
+            assert_ne!(after.client_random, before.client_random);
+            assert_ne!(after.exporter, before.exporter);
+            assert_eq!(after.master, server.master_secret());
+        } else {
+            // A Finished under the old keys instead of the server's CCS.
+            let _ = client.write_tls();
+            server
+                .test_emit_encrypted(ContentType::Handshake, &forged_finished())
+                .unwrap();
+            client.read_tls(&server.write_tls());
+            assert_eq!(client.process_new_packets(), Err(Error::UnexpectedMessage));
+            assert_eq!(client_view(&client), before);
+        }
+    }
+}

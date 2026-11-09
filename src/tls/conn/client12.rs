@@ -707,6 +707,44 @@ fn system_now() -> Option<Time> {
     None
 }
 
+/// The session-visible state of the handshake a renegotiation is replacing.
+///
+/// While a renegotiation is in flight the connection is still the *old*
+/// session as far as the application can tell: application data keeps
+/// arriving under the old keys until the server's ChangeCipherSpec, so
+/// everything an accessor or the exporter reports must keep describing the
+/// handshake that authenticated those keys. The new handshake's values are
+/// unproven until the server's `Finished` verifies.
+///
+/// So the old values are parked here when the renegotiation starts; the
+/// engine's own fields then hold the in-flight handshake's working state
+/// (which the handshake needs for its key derivation and `Finished`), and
+/// every accessor reads from this snapshot for as long as it exists. It is
+/// dropped — committing the new session — only once the server's `Finished`
+/// has verified, and moved back if the renegotiation fails or the server
+/// declines it.
+struct ReplacedSession {
+    suite: Option<SuiteParams12>,
+    master: Option<[u8; 48]>,
+    client_random: Random,
+    server_random: Option<Random>,
+    cert_chain: Vec<Vec<u8>>,
+    peer_signature_scheme: Option<SignatureScheme>,
+    peer_share: Option<(NamedGroup, Vec<u8>)>,
+    alpn_negotiated: Option<Vec<u8>>,
+    resumed: bool,
+    ems_negotiated: bool,
+    peer_ocsp_response: Option<Vec<u8>>,
+}
+
+impl Drop for ReplacedSession {
+    fn drop(&mut self) {
+        if let Some(m) = self.master.as_mut() {
+            super::wipe(m);
+        }
+    }
+}
+
 /// A TLS 1.2 client connection.
 ///
 /// Created by [`ClientConnection12::new`]; drive it with `read_tls` /
@@ -735,11 +773,10 @@ pub struct ClientConnection12 {
     /// once at construction when [`ClientConfig12::renegotiation`] is
     /// enabled (the client otherwise keeps no RNG past its first flight).
     reneg_rng: Option<crate::rng::HmacDrbg<Sha256>>,
-    /// The `client_random` of the session being replaced, kept while a
-    /// renegotiation waits for the `ServerHello`: a server declining it
-    /// with `no_renegotiation` leaves that session, exporter inputs
-    /// included, in place.
-    reneg_saved_client_random: Option<Random>,
+    /// The session a renegotiation in flight is replacing — what the
+    /// accessors and the exporter report until the server's `Finished`
+    /// verifies (see [`ReplacedSession`]). `None` outside a renegotiation.
+    replaced: Option<ReplacedSession>,
     /// True once the handshake has actually completed (the server's Finished
     /// verified and the engine entered [`State::Connected`]). Sticky: it stays
     /// set after a later transition to [`State::Closed`], and — unlike
@@ -1044,7 +1081,7 @@ impl ClientConnection12 {
             hello_request_warned: false,
             reneg: RenegState::default(),
             reneg_rng,
-            reneg_saved_client_random: None,
+            replaced: None,
             handshake_completed: false,
             inbuf: Vec::new(),
             in_off: 0,
@@ -1210,7 +1247,7 @@ impl ClientConnection12 {
             hello_request_warned: false,
             reneg: RenegState::default(),
             reneg_rng,
-            reneg_saved_client_random: None,
+            replaced: None,
             handshake_completed: false,
             inbuf: Vec::new(),
             in_off: 0,
@@ -1397,13 +1434,26 @@ impl ClientConnection12 {
         if let Some(ls) = self.legacy_suite {
             return Some(ls.suite.0);
         }
-        self.suite.map(|s| s.suite.0)
+        self.visible_suite().map(|s| s.suite.0)
+    }
+
+    /// The suite of the session in force: the handshake being replaced
+    /// while a renegotiation is in flight (see [`ReplacedSession`]).
+    fn visible_suite(&self) -> Option<SuiteParams12> {
+        match &self.replaced {
+            Some(prev) => prev.suite,
+            None => self.suite,
+        }
     }
 
     /// The ECDHE group of the key exchange, once `ServerKeyExchange` fixed
     /// it (`None` for a resumed session, which performs no key exchange).
     pub fn negotiated_group(&self) -> Option<NamedGroup> {
-        self.peer_share.as_ref().map(|(g, _)| *g)
+        match &self.replaced {
+            Some(prev) => prev.peer_share.as_ref(),
+            None => self.peer_share.as_ref(),
+        }
+        .map(|(g, _)| *g)
     }
 
     /// Protocol version string (`"TLSv1.2"`, or `"TLSv1.1"`/`"TLSv1.0"` on the
@@ -1417,7 +1467,7 @@ impl ClientConnection12 {
                 _ => "TLS",
             });
         }
-        self.suite.map(|_| "TLSv1.2")
+        self.visible_suite().map(|_| "TLSv1.2")
     }
 
     /// The negotiated record-layer protocol version once it is fixed (after the
@@ -1428,28 +1478,47 @@ impl ClientConnection12 {
         if self.legacy_suite.is_some() {
             return Some(self.negotiated_version);
         }
-        self.suite.map(|_| self.negotiated_version)
+        self.visible_suite().map(|_| self.negotiated_version)
     }
 
     /// The peer's certificate chain in wire order (DER), leaf first.
+    ///
+    /// During a renegotiation this — like every other accessor describing
+    /// the session — keeps reporting the handshake being replaced until the
+    /// new one's `Finished` has verified.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
-        &self.cert_chain
+        match &self.replaced {
+            Some(prev) => &prev.cert_chain,
+            None => &self.cert_chain,
+        }
     }
 
     /// The IANA `SignatureScheme` code point of the peer's verified
     /// handshake signature — its `ServerKeyExchange` — once verified.
     pub fn peer_signature_scheme(&self) -> Option<u16> {
-        self.peer_signature_scheme.map(|s| s.0)
+        match &self.replaced {
+            Some(prev) => prev.peer_signature_scheme,
+            None => self.peer_signature_scheme,
+        }
+        .map(|s| s.0)
     }
 
     /// The ALPN protocol the server selected, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.alpn_negotiated.as_deref()
+        match &self.replaced {
+            Some(prev) => prev.alpn_negotiated.as_deref(),
+            None => self.alpn_negotiated.as_deref(),
+        }
     }
 
     /// The client random sent in the ClientHello (matches the wire bytes).
+    /// While a renegotiation is in flight, that of the session being
+    /// replaced — the one [`Self::master_secret`] pairs with.
     pub fn client_random(&self) -> [u8; 32] {
-        self.client_random
+        match &self.replaced {
+            Some(prev) => prev.client_random,
+            None => self.client_random,
+        }
     }
 
     /// The TLS 1.2 master secret derived during the handshake. Returns `None`
@@ -1460,7 +1529,10 @@ impl ClientConnection12 {
     /// The connection's own copy is scrubbed on drop; the returned copy
     /// is the caller's to wipe.
     pub fn master_secret(&self) -> Option<[u8; 48]> {
-        self.master
+        match &self.replaced {
+            Some(prev) => prev.master,
+            None => self.master,
+        }
     }
 
     /// Returns the latest stored session suitable for RFC 5077 resumption
@@ -1498,7 +1570,10 @@ impl ClientConnection12 {
 
     /// `true` if this handshake resumed a prior session via RFC 5077.
     pub fn did_resume(&self) -> bool {
-        self.resumed
+        match &self.replaced {
+            Some(prev) => prev.resumed,
+            None => self.resumed,
+        }
     }
 
     /// DER bytes of the OCSP response stapled by the peer (RFC 6066 §8),
@@ -1507,12 +1582,18 @@ impl ClientConnection12 {
     /// when `verify_certificates` was enabled — `None` here means the server
     /// did not staple.
     pub fn peer_ocsp_response(&self) -> Option<&[u8]> {
-        self.peer_ocsp_response.as_deref()
+        match &self.replaced {
+            Some(prev) => prev.peer_ocsp_response.as_deref(),
+            None => self.peer_ocsp_response.as_deref(),
+        }
     }
 
     /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
     pub fn ems_negotiated(&self) -> bool {
-        self.ems_negotiated
+        match &self.replaced {
+            Some(prev) => prev.ems_negotiated,
+            None => self.ems_negotiated,
+        }
     }
 
     /// RFC 5705 §4 — TLS 1.2 application-layer Exporter. Derives `out.len()`
@@ -1541,18 +1622,26 @@ impl ClientConnection12 {
         if context.is_some_and(|c| c.len() > u16::MAX as usize) {
             return Err(Error::IllegalParameter);
         }
-        let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
-        let suite = self.suite.ok_or(Error::InappropriateState)?;
-        let sr = self.server_random.ok_or(Error::InappropriateState)?;
-        tls12_exporter(
-            suite.hash,
-            master,
-            label,
-            &self.client_random,
-            &sr,
-            context,
-            out,
-        );
+        // Mid-renegotiation the exporter stays bound to the session whose
+        // keys still protect the application data (see `ReplacedSession`).
+        let (master, suite, cr, sr) = match &self.replaced {
+            Some(prev) => (
+                prev.master.as_ref(),
+                prev.suite,
+                prev.client_random,
+                prev.server_random,
+            ),
+            None => (
+                self.master.as_ref(),
+                self.suite,
+                self.client_random,
+                self.server_random,
+            ),
+        };
+        let master = master.ok_or(Error::InappropriateState)?;
+        let suite = suite.ok_or(Error::InappropriateState)?;
+        let sr = sr.ok_or(Error::InappropriateState)?;
+        tls12_exporter(suite.hash, master, label, &cr, &sr, context, out);
         Ok(())
     }
 
@@ -1694,7 +1783,41 @@ impl ClientConnection12 {
     /// (see [`crate::tls::Connection::abort_with_alert`]).
     pub(crate) fn abort(&mut self, description: AlertDescription) {
         let _ = self.emit_alert(&[2u8, description.as_u8()]); // level = fatal
+        self.close();
+    }
+
+    /// Parks the engine in [`State::Closed`]. A renegotiation still in
+    /// flight dies with the connection: its unproven session state is
+    /// discarded (the new master secret wiped) and the session it was
+    /// replacing — the last one the peer actually authenticated — is what
+    /// the accessors keep describing.
+    fn close(&mut self) {
         self.state = State::Closed;
+        self.restore_replaced_session();
+    }
+
+    /// Drops the in-flight renegotiation's session state (wiping its master
+    /// secret) and puts the session it was replacing back in the engine's
+    /// own fields. A no-op outside a renegotiation.
+    fn restore_replaced_session(&mut self) {
+        let Some(mut prev) = self.replaced.take() else {
+            return;
+        };
+        if let Some(m) = self.master.as_mut() {
+            super::wipe(m);
+        }
+        self.suite = prev.suite;
+        self.master = prev.master.take();
+        self.client_random = prev.client_random;
+        self.server_random = prev.server_random;
+        self.cert_chain = core::mem::take(&mut prev.cert_chain);
+        self.peer_signature_scheme = prev.peer_signature_scheme;
+        self.peer_share = prev.peer_share.take();
+        self.alpn_negotiated = prev.alpn_negotiated.take();
+        self.resumed = prev.resumed;
+        self.ems_negotiated = prev.ems_negotiated;
+        self.peer_ocsp_response = prev.peer_ocsp_response.take();
+        self.pending_server_crypter = None;
     }
 
     /// Processes all buffered records, advancing the handshake. On a protocol
@@ -1763,13 +1886,13 @@ impl ClientConnection12 {
                         // injectable). Fail the handshake hard so no caller
                         // mistakes the closed engine for a completed one.
                         AlertDescription::CloseNotify if !self.handshake_completed => {
-                            self.state = State::Closed;
+                            self.close();
                             self.ccs_window_open = false;
                             return Err(Error::AlertReceived(AlertDescription::CloseNotify));
                         }
                         AlertDescription::CloseNotify => {
                             self.received_close_notify = true;
-                            self.state = State::Closed;
+                            self.close();
                             return Ok(());
                         }
                         // RFC 5746 §4.4 / RFC 5246 §7.2.2: the server declined
@@ -1797,7 +1920,7 @@ impl ClientConnection12 {
                             // the engine in `Closed` so no further records
                             // are processed and writes are refused
                             // (RFC 5246 §7.2.2), matching the TLS 1.3 core.
-                            self.state = State::Closed;
+                            self.close();
                             self.ccs_window_open = false;
                             return Err(Error::AlertReceived(alert.description));
                         }
@@ -1815,7 +1938,7 @@ impl ClientConnection12 {
     fn fail(&mut self, error: &Error) {
         let body = [2u8, alert_for(error).as_u8()]; // level = fatal
         let _ = self.emit_alert(&body);
-        self.state = State::Closed;
+        self.close();
     }
 
     /// Writes a plaintext record straight to the outbound buffer. A
@@ -1836,7 +1959,7 @@ impl ClientConnection12 {
             let cap = record_fragment_cap(self.peer_record_size_limit);
             for chunk in fragments(payload, cap) {
                 if self.emit_encrypted(ct, chunk).is_err() {
-                    self.state = State::Closed;
+                    self.close();
                     return;
                 }
             }
@@ -2176,8 +2299,10 @@ impl ClientConnection12 {
 
     /// Resets the per-handshake state and sends the renegotiating
     /// ClientHello. The session-visible state (suite, master secret,
-    /// certificates, ALPN) is replaced as the new handshake's messages
-    /// arrive; the record keys only at the ChangeCipherSpecs.
+    /// randoms, certificates, ALPN) is parked in `replaced`, which the
+    /// accessors and the exporter keep reporting until the new handshake's
+    /// server Finished verifies (see [`ReplacedSession`]); the record keys
+    /// change only at the ChangeCipherSpecs.
     fn start_renegotiation(&mut self) -> Result<(), Error> {
         let rng = self.reneg_rng.as_mut().ok_or(Error::InappropriateState)?;
         self.x25519 = X25519PrivateKey::generate(rng);
@@ -2186,17 +2311,29 @@ impl ClientConnection12 {
         self.p521 = BoxedEcdhPrivateKey::generate(CurveId::P521, rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
-        self.reneg_saved_client_random = Some(self.client_random);
+        let prev = ReplacedSession {
+            suite: self.suite,
+            master: self.master.take(),
+            client_random: self.client_random,
+            server_random: self.server_random.take(),
+            cert_chain: core::mem::take(&mut self.cert_chain),
+            peer_signature_scheme: self.peer_signature_scheme.take(),
+            peer_share: self.peer_share.take(),
+            alpn_negotiated: self.alpn_negotiated.take(),
+            resumed: self.resumed,
+            ems_negotiated: self.ems_negotiated,
+            peer_ocsp_response: self.peer_ocsp_response.take(),
+        };
         self.client_random = random;
 
         self.reneg.active = true;
-        self.reneg.prev_peer_leaf = self.cert_chain.first().cloned();
+        self.reneg.prev_peer_leaf = prev.cert_chain.first().cloned();
+        self.replaced = Some(prev);
         self.state = State::WaitServerHello;
         self.transcript = Transcript::new();
         self.ccs_window_open = true;
         self.ccs_received = false;
         self.pending_server_crypter = None;
-        self.peer_share = None;
         self.cert_request_received = false;
         self.client_cert_scheme = None;
         self.nst_received = false;
@@ -2223,9 +2360,7 @@ impl ClientConnection12 {
     /// The server declined our renegotiation (`no_renegotiation` before any
     /// ServerHello): keep the current session, flushing what was queued.
     fn abandon_renegotiation(&mut self) -> Result<(), Error> {
-        if let Some(cr) = self.reneg_saved_client_random.take() {
-            self.client_random = cr;
-        }
+        self.restore_replaced_session();
         self.state = State::Connected;
         self.ccs_window_open = false;
         self.end_renegotiation()
@@ -2236,7 +2371,6 @@ impl ClientConnection12 {
     fn end_renegotiation(&mut self) -> Result<(), Error> {
         self.reneg.active = false;
         self.reneg.prev_peer_leaf = None;
-        self.reneg_saved_client_random = None;
         let queued = core::mem::take(&mut self.reneg.pending_app_out);
         if !queued.is_empty() {
             // `send_application_data` refuses after our close_notify; the
@@ -2413,7 +2547,6 @@ impl ClientConnection12 {
             self.inbound_record_size_limit = None;
             self.server_echoed_ocsp_staple = false;
             self.peer_ocsp_response = None;
-            self.reneg_saved_client_random = None;
         }
 
         // ALPN echo: at most one protocol, drawn from our offer.
@@ -2986,6 +3119,19 @@ impl ClientConnection12 {
         if let Some(b) = self.reneg.client_verify_data.first_mut() {
             *b ^= 1;
         }
+    }
+
+    /// Test-only: encrypt and emit an attacker-shaped record (any content
+    /// type, any payload) under the client's outbound crypter, bypassing
+    /// the state machine — a hostile client's hand-rolled handshake
+    /// messages, or application data sent mid-renegotiation.
+    #[cfg(test)]
+    pub(super) fn test_emit_encrypted(
+        &mut self,
+        ct: ContentType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        self.emit_encrypted(ct, payload)
     }
 
     /// Test hook: the derived 48-byte master secret, once the key exchange
@@ -3595,6 +3741,9 @@ impl ClientConnection12 {
         self.state = State::Connected;
         self.handshake_completed = true;
         if self.reneg.active {
+            // The server's Finished verified: commit the new session (the
+            // replaced one is dropped, its master secret wiped).
+            self.replaced = None;
             self.reneg.completed = self.reneg.completed.saturating_add(1);
             self.end_renegotiation()?;
         }
