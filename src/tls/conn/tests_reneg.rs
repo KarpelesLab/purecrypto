@@ -1179,3 +1179,97 @@ fn missing_previous_leaf_is_only_acceptable_to_a_server() {
         );
     }
 }
+
+/// Resumes `session` against a fresh [`ticket_server`] and reports whether
+/// the server accepted the ticket (an abbreviated handshake) — which it
+/// only does, and the Finished messages only verify, when the ticket and
+/// the stored master secret belong together.
+fn resumes(der: &[u8], session: crate::tls::conn::StoredSession12) -> bool {
+    let (cfg, _) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f5-rs");
+    let mut client = ticket_client(roots(der), enabled(), Some(session), b"reneg-f5-rc");
+    pump_ok(&mut client, &mut server);
+    client.did_resume() && server.did_resume()
+}
+
+/// `take_session` never pairs a ticket with a master secret other than the
+/// one it seals: nothing is handed out while a renegotiation is in flight,
+/// the renegotiated handshake's own ticket replaces the earlier one, and a
+/// renegotiation that brings no ticket leaves no session to store.
+#[test]
+fn take_session_pairs_a_ticket_with_its_own_handshake() {
+    // Mid-renegotiation: nothing, and nothing is lost by asking.
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f5-s1");
+    let mut client = ticket_client(roots(&der), enabled(), None, b"reneg-f5-c1");
+    pump_ok(&mut client, &mut server);
+    let ms_first = client.master_secret().unwrap();
+    client.renegotiate().unwrap();
+    assert!(client.take_session().is_none());
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    client.read_tls(&server.write_tls());
+    client.process_new_packets().unwrap();
+    // The new master secret is derived, the server's Finished not yet in.
+    assert!(client.is_renegotiating());
+    assert!(client.take_session().is_none());
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.renegotiation_count(), 1);
+    // The renegotiated handshake issued its own ticket: that pair resumes.
+    let session = client
+        .take_session()
+        .expect("a ticket from the renegotiation");
+    assert_ne!(session.master_secret, ms_first);
+    assert_eq!(Some(session.master_secret), client.master_secret());
+    assert!(resumes(&der, session));
+    assert!(client.take_session().is_none());
+
+    // A renegotiation that issues no ticket: the first handshake's ticket
+    // is not handed out with the renegotiated master secret.
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f5-s2");
+    let mut client = ticket_client(roots(&der), enabled(), None, b"reneg-f5-c2");
+    pump_ok(&mut client, &mut server);
+    let (mut no_tickets, _) = ecdsa_server12(b"reneg-server-key-a");
+    no_tickets.renegotiation = enabled();
+    server.test_replace_config(no_tickets);
+    client.renegotiate().unwrap();
+    pump_ok(&mut client, &mut server);
+    assert_eq!(client.renegotiation_count(), 1);
+    assert!(client.take_session().is_none());
+
+    // A declined renegotiation leaves the first session, ticket included.
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, RenegotiationPolicy::default(), b"reneg-f5-s3");
+    let mut client = ticket_client(roots(&der), enabled(), None, b"reneg-f5-c3");
+    pump_ok(&mut client, &mut server);
+    let ms = client.master_secret().unwrap();
+    client.renegotiate().unwrap();
+    assert!(client.take_session().is_none());
+    pump_ok(&mut client, &mut server);
+    assert!(!client.is_renegotiating());
+    let session = client.take_session().expect("the first handshake's ticket");
+    assert_eq!(session.master_secret, ms);
+    assert!(resumes(&der, session));
+
+    // So does one that fails after the new master secret was derived.
+    let (cfg, der) = ticket_server();
+    let mut server = server_with(cfg, enabled(), b"reneg-f5-s4");
+    let mut client = ticket_client(roots(&der), enabled(), None, b"reneg-f5-c4");
+    pump_ok(&mut client, &mut server);
+    let ms = client.master_secret().unwrap();
+    client.renegotiate().unwrap();
+    server.read_tls(&client.write_tls());
+    server.process_new_packets().unwrap();
+    client.read_tls(&server.write_tls());
+    client.process_new_packets().unwrap();
+    let _ = client.write_tls();
+    server
+        .test_emit_encrypted(ContentType::Handshake, &forged_finished())
+        .unwrap();
+    client.read_tls(&server.write_tls());
+    assert_eq!(client.process_new_packets(), Err(Error::UnexpectedMessage));
+    let session = client.take_session().expect("the first handshake's ticket");
+    assert_eq!(session.master_secret, ms);
+    assert!(resumes(&der, session));
+}

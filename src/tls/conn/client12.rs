@@ -746,6 +746,13 @@ struct ReplacedSession {
     resumed: bool,
     ems_negotiated: bool,
     peer_ocsp_response: Option<Vec<u8>>,
+    /// The ticket the replaced handshake was issued (and its lifetime
+    /// hint), if the caller has not taken it yet. A ticket seals the
+    /// master secret of the handshake that issued it, so it leaves with
+    /// that handshake: it comes back only if the renegotiation does not
+    /// complete.
+    received_ticket: Option<Vec<u8>>,
+    received_ticket_lifetime: u32,
 }
 
 impl Drop for ReplacedSession {
@@ -1565,13 +1572,24 @@ impl ClientConnection12 {
     /// by injecting a NST into a handshake it then let fail. Like the TLS 1.3
     /// engine, which only stores a session after the handshake, nothing is
     /// returned before `handshake_completed`.
+    ///
+    /// The same goes for a renegotiation: `None` while one is in flight
+    /// (its master secret and any ticket it brought are unconfirmed until
+    /// the server's Finished verifies). A ticket is only ever paired with
+    /// the master secret of the handshake that issued it — once a
+    /// renegotiation completes, the session returned is the renegotiated
+    /// one if that handshake issued a ticket, and there is none to return
+    /// if it did not (the previous handshake's ticket seals a master
+    /// secret this connection no longer has). A renegotiation the server
+    /// declines, or that fails, leaves the previous session's ticket in
+    /// place.
     pub fn take_session(&mut self) -> Option<StoredSession12> {
-        if !self.handshake_completed {
+        if !self.handshake_completed || self.reneg.active {
             return None;
         }
-        let ticket = self.received_ticket.take()?;
         let suite = self.suite?;
         let master = self.master?;
+        let ticket = self.received_ticket.take()?;
         Some(StoredSession12 {
             ticket,
             master_secret: master,
@@ -1853,6 +1871,10 @@ impl ClientConnection12 {
         self.resumed = prev.resumed;
         self.ems_negotiated = prev.ems_negotiated;
         self.peer_ocsp_response = prev.peer_ocsp_response.take();
+        // A ticket the abandoned handshake delivered is as unconfirmed as
+        // the rest of it; the replaced session gets its own back.
+        self.received_ticket = prev.received_ticket.take();
+        self.received_ticket_lifetime = prev.received_ticket_lifetime;
         self.pending_server_crypter = None;
     }
 
@@ -2392,6 +2414,11 @@ impl ClientConnection12 {
             resumed: self.resumed,
             ems_negotiated: self.ems_negotiated,
             peer_ocsp_response: self.peer_ocsp_response.take(),
+            // Leaves with the handshake that issued it: if the new one
+            // completes without a NewSessionTicket there is no session to
+            // store, rather than the old ticket with the new master secret.
+            received_ticket: self.received_ticket.take(),
+            received_ticket_lifetime: core::mem::take(&mut self.received_ticket_lifetime),
         };
         self.client_random = random;
 
