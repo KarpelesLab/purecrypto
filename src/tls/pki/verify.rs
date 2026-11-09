@@ -877,7 +877,9 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 ///   certificate for some other name and have it accepted, which is exactly
 ///   what a `CA:FALSE` anchor without this check could do. A re-issued
 ///   copy of such a pin (same subject and SPKI, different bytes) is accepted
-///   only when its `subjectAltName` entries are a subset of the anchor's and
+///   only when its `subjectAltName` entries are a subset of the anchor's,
+///   it has a `subjectAltName` extension exactly when the anchor does (a
+///   SAN-less re-mint would be matched by its commonName instead), and
 ///   its `extKeyUsage` a subset of the anchor's (an anchor without EKU
 ///   permits any): otherwise the pinned key could re-mint itself for another
 ///   service's name. Validity is not bounded by the anchor's, so renewing a
@@ -919,6 +921,18 @@ fn enforce_anchor_constraints(
                 .subject_alt_name_entries()
                 .map_err(|_| Error::BadCertificate)?;
             if !sans.iter().all(|e| pin.san_entries.contains(e)) {
+                return Err(Error::BadCertificate);
+            }
+            // The subset test is vacuous for a re-mint with no SAN
+            // extension, and such a certificate is matched by its subject
+            // commonName instead (`verify_hostname`) — a name a SAN-bearing
+            // pin never authenticated. The extension must be present
+            // exactly when the pin has it.
+            if top
+                .has_subject_alt_name()
+                .map_err(|_| Error::BadCertificate)?
+                != pin.has_san
+            {
                 return Err(Error::BadCertificate);
             }
             if !anchor.extended_key_usages.is_empty() {
@@ -3653,6 +3667,64 @@ mod tests {
             check(&pinned_nosan, alloc::vec![renewed.to_der().to_vec()]),
             Err(Error::BadCertificate),
             "a SAN-less pin must not be re-minted with a SAN"
+        );
+        // The reverse: a SAN-bearing pin whose commonName is a *different*
+        // host than its SAN. The pin authenticates `pinned.example` only
+        // (the CN is ignored when a SAN extension is present). A re-mint by
+        // the same key that drops the SAN extension would be matched by its
+        // CN and so authenticate `other.example`; it must be refused.
+        let cn_other = DistinguishedName::common_name("other.example");
+        let pinned_cn_other = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &cn_other,
+            &validity(),
+            16,
+            &leaf_exts("pinned.example"),
+        )
+        .unwrap();
+        verify_hostname(&pinned_cn_other, "pinned.example").unwrap();
+        assert!(verify_hostname(&pinned_cn_other, "other.example").is_err());
+        let san_dropped = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &cn_other,
+            &validity(),
+            17,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+            ],
+        )
+        .unwrap();
+        // This is what makes the re-mint dangerous if it were accepted.
+        verify_hostname(&san_dropped, "other.example").unwrap();
+        assert_eq!(
+            check(&pinned_cn_other, alloc::vec![san_dropped.to_der().to_vec()]),
+            Err(Error::BadCertificate),
+            "a SAN-bearing pin must not be re-minted without its SAN"
+        );
+        // The pin itself, and a SAN-preserving renewal, still validate.
+        assert_eq!(
+            check(
+                &pinned_cn_other,
+                alloc::vec![pinned_cn_other.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+        let renewed_cn_other = Certificate::self_signed_with_extensions(
+            &pinned_signer,
+            &cn_other,
+            &validity(),
+            18,
+            &leaf_exts("pinned.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            check(
+                &pinned_cn_other,
+                alloc::vec![renewed_cn_other.to_der().to_vec()]
+            ),
+            Ok(())
         );
 
         // Case 2: CA:TRUE but keyUsage without keyCertSign — may not issue.

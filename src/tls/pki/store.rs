@@ -79,8 +79,13 @@ pub(crate) struct TrustAnchor {
 /// different pinned service) or a wider `extKeyUsage`. A re-issued pin is
 /// therefore accepted only when it is byte-identical to the anchor, or when
 /// its SAN entries are a subset of the anchor's (byte-for-byte per
-/// `GeneralName`) and its EKU is a subset of the anchor's (an anchor without
-/// EKU permits any). Validity is deliberately NOT bounded by the anchor's,
+/// `GeneralName`), it carries a `subjectAltName` extension exactly when the
+/// anchor does, and its EKU is a subset of the anchor's (an anchor without
+/// EKU permits any). The presence rule matters because host-name matching
+/// falls back to the subject commonName only for a certificate with no SAN
+/// extension: a re-mint that merely *dropped* the SAN of a SAN-bearing pin
+/// would pass the subset test vacuously and then authenticate the pin's CN,
+/// a name the pin itself never did. Validity is deliberately NOT bounded by the anchor's,
 /// so renewal of an expiring pin keeps working.
 #[derive(Clone)]
 pub(crate) struct PinnedIdentity {
@@ -89,6 +94,9 @@ pub(crate) struct PinnedIdentity {
     /// The anchor's `subjectAltName` entries as raw `(tag, content)` pairs,
     /// empty when the anchor has no SAN extension.
     pub(crate) san_entries: Vec<(u8, Vec<u8>)>,
+    /// Whether the anchor carries a `subjectAltName` extension at all (it
+    /// may be present yet hold no entries).
+    pub(crate) has_san: bool,
 }
 
 /// A set of trusted root certificates against which peer chains are verified.
@@ -195,6 +203,9 @@ impl RootCertStore {
             Some(PinnedIdentity {
                 san_entries: cert
                     .subject_alt_name_entries()
+                    .map_err(|_| Error::BadCertificate)?,
+                has_san: cert
+                    .has_subject_alt_name()
                     .map_err(|_| Error::BadCertificate)?,
                 cert_der: cert.to_der().to_vec(),
             })
