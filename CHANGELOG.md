@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.5](https://github.com/KarpelesLab/purecrypto/compare/v0.10.4...v0.10.5) - 2026-11-09
+
+### Fixed
+
+- *(quic)* cap the congestion window at 10000 packets
+- *(quic)* drop per-datagram table walks from the QuicServer router
+- *(quic)* make stream loss handling linear in the lost batch
+- *(quic)* no compatible version switch after Initial keys are discarded
+- *(quic)* never adopt the Retry SCID as a connection ID
+- *(ec)* wipe plaintext PKCS#8 intermediates in the Ed25519/Ed448/X25519/X448 codecs
+- *(cli)* name the serial when ca fails to record a delivered cert
+- *(cli)* zeroize the key bytes read by pkeyutl sign's stateful pre-check
+- *(cli)* bound cmsg lengths with checked arithmetic in parse_ecn
+- *(cli)* s_client treats a TCP reset mid-stream as a truncation
+- *(cli)* bound q_server's buffering of peer uni streams
+- *(cli)* print certificate-controlled strings terminal-safe
+- *(cli)* crl runs every mode, normalises serials, separates errors
+- *(cli)* bind -aad to AES-SIV ciphertexts in enc
+- *(cli)* never read a flag's value as a flag (argument injection)
+- *(dtls)* length-prefix the variable-length cookie MAC inputs
+- *(dtls)* do not count a pinned verification_time as 0-RTT freshness
+- *(dtls)* only resume a 1.3 PSK whose hash is the negotiated suite's
+- *(dtls)* never deliver a plaintext-planted message after the 1.3 ServerHello
+- *(chacha20)* scrub the partial-pass keystream of the x86 kernels
+- *(poly1305)* wipe the IFMA kernel's powers of r and accumulators
+- *(cpu)* never execute CPUID inside an SGX enclave; gate BMI on AVX
+- *(pqc)* wipe plaintext PKCS#8 intermediates
+- *(mldsa)* wipe raw sampler bytes in scalar expand_mask and RejBoundedPoly
+- *(falcon)* wipe FFT temporaries that hold secret polynomials
+- *(tls)* pair a session ticket only with its own handshake's master secret
+- *(tls)* hold a resumed session's renegotiation to the original server leaf
+- *(tls)* bound declined renegotiation requests in both roles
+- *(tls)* stop delivering application data after a failed renegotiation
+- *(tls)* stage renegotiation session state until Finished verifies
+- *(dh)* scale from_params' Miller-Rabin rounds for q with its width
+- *(dsa)* wipe private-key DER/PEM intermediates on export and import
+- *(rsa)* wipe the prime-search window start and sieve residues
+- *(ec)* accept 576-bit-order DER signatures under ec-custom; check key versions
+- *(ec)* wipe private-scalar copies in boxed EC / SM2 key codecs and P-256 ECDH
+- *(ec)* bound explicit curve parameters before any bignum arithmetic
+- *(signature-registry)* refuse legacy-ec binary curves unless opted in
+- *(tls/keylog)* refuse a pre-existing keylog file owned by another user
+- *(tls/pki)* refuse a re-minted pin that drops the pin's SAN extension
+- *(tls/pki)* honour fingerprint distrust for a root in the store
+- *(tls)* do not count a pinned verification_time as 0-RTT freshness
+
+### Other
+
+- pin the BoringSSL and i686 Valgrind jobs to ubuntu-24.04
+- *(cli)* compare the crl -text serial numerically
+- *(ffi)* correct the Retry token lifetime and clock-less Retry wording
+- *(quic)* correct Retry token lifetime and clock-less Retry wording
+- *(tls)* the DTLS 1.3 server does tickets, PSK resumption and 0-RTT
+- *(zkp)* rangeproof rewind wipes its scratch on every return path
+- *(validation)* list the fuzz targets the at-a-glance matrix had missed
+- *(ffi)* DTLS handles do exchange and report close_notify
+- *(tls)* document the static-RSA exemption from min_rsa_key_bits
+- *(fuzz)* cover binary curves, custom EC params, pairings, hasher state import, TLS 1.2 renegotiation
+- *(fuzz)* rustfmt the existing targets
+
 ## [0.10.4](https://github.com/KarpelesLab/purecrypto/compare/v0.10.3...v0.10.4) - 2026-10-31
 
 ### Added
