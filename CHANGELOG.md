@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6](https://github.com/KarpelesLab/purecrypto/compare/v0.10.5...v0.10.6) - 2026-11-11
+
+### Other
+
+- *(deps)* bump compcol to 0.8.0
+
 ## [0.10.5](https://github.com/KarpelesLab/purecrypto/compare/v0.10.4...v0.10.5) - 2026-11-09
 
 ### Fixed
