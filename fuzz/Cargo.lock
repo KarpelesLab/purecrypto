@@ -34,9 +34,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "compcol"
-version = "0.7.2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "971c6ed76a2a81874d4d3e398e214df01ed1d2355cdc772bc26f16027c383cea"
+checksum = "f4be160df80e77bdf4902bb026c6a0f6c700ec7793379c26305d45e293e17b8c"
 
 [[package]]
 name = "find-msvc-tools"
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "purecrypto"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "cacrt",
  "compcol",
